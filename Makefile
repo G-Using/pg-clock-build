@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = PerfectGrabber
 PerfectGrabber_FILES = Tweak.xm PerfectGrabberPreferences.m PGGrabberOverlayView.m PGGrabberHUDView.m PGGrabberLandscapeBar.m
 PerfectGrabber_CFLAGS = -fobjc-arc
-PerfectGrabber_FRAMEWORKS = Foundation UIKit AudioToolbox
+PerfectGrabber_FRAMEWORKS = Foundation UIKit AudioToolbox CoreMotion
 
 BUNDLE_NAME = PerfectGrabberSettings
 PerfectGrabberSettings_FILES = prefs/PerfectGrabberSettingsController.m
