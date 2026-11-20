@@ -20,6 +20,9 @@ PerfectGrabberSettings_FRAMEWORKS = Foundation UIKit
 # 关掉 autolink 后这些符号在设备上由 Preferences.framework 运行时提供（bundle 默认
 # -undefined dynamic_lookup）。Foundation/UIKit 已显式写在 _FRAMEWORKS 里，不受影响。
 PerfectGrabberSettings_CFLAGS = -fobjc-arc -fno-autolink
+# PSListController / PSSpecifier / PS*Key 这些符号设备上由 Preferences.framework 提供，
+# 链接期必须放行未定义符号，否则 ld 报 Undefined symbols。
+PerfectGrabberSettings_LDFLAGS = -undefined dynamic_lookup
 PerfectGrabberSettings_RESOURCE_DIRS = prefs/Resources
 
 include $(THEOS_MAKE_PATH)/tweak.mk
