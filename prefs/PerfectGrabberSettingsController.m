@@ -141,7 +141,7 @@ static void PGWriteValue(NSString *key, id value) {
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"触发方式"]];
     [items addObject:[self preferenceNamed:@"上滑时显示" key:@"ShowOnSwipeUp" defaultValue:@YES cell:PSSwitchCell]];
-    [items addObject:[self preferenceNamed:@"横屏常驻显示" key:@"LandscapeAlwaysOn" defaultValue:@YES cell:PSSwitchCell]];
+    [items addObject:[self preferenceNamed:@"常驻显示（竖屏在灵动岛下方）" key:@"LandscapeAlwaysOn" defaultValue:@YES cell:PSSwitchCell]];
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"显示"]];
     [items addObject:[self preferenceNamed:@"使用 12 小时制" key:@"Disable24H" defaultValue:@NO cell:PSSwitchCell]];
@@ -166,7 +166,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"上滑背景颜色" action:@selector(chooseSwipeUpBackgroundColor)]];
 
     PSSpecifier *diagnostic = [PSSpecifier groupSpecifierWithName:@"排查"];
-    [diagnostic setProperty:@"横屏看不到块时打开「强制横屏显示」：若块出现，说明方向判定有问题；若仍不出现，说明显示层没生效。诊断日志写在 /var/mobile/Media/PerfectGrabber.log。"
+    [diagnostic setProperty:@"「强制横屏显示」仅供排查：打开后不管手机怎么拿都按横屏排版，竖屏下会显示成一条竖着的窄条，这是正常的。排查完请务必关掉。诊断日志：/var/mobile/Media/PerfectGrabber.log"
                    forKey:PSFooterTextGroupKey];
     [items addObject:diagnostic];
     [items addObject:[self preferenceNamed:@"强制横屏显示（排查用）" key:@"DebugForceLandscape" defaultValue:@NO cell:PSSwitchCell]];
@@ -176,7 +176,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-10+roothide36" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-11+roothide37" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;

@@ -15,6 +15,9 @@
 /// 横屏块距屏幕顶边的距离（横屏下的顶边是物理侧边，没有刘海，给一点留白即可）。
 static const CGFloat PGLandscapeBarTopInset = 6.0;
 
+/// 竖屏时块落在灵动岛/刘海下方，与安全区再留一点空隙。
+static const CGFloat PGLandscapeBarPortraitGap = 4.0;
+
 /// 轮询间隔。方向变化没有可靠且单一的公开通知可依赖，轮询只做几次属性比较，开销可忽略。
 static const NSTimeInterval PGLandscapePollInterval = 0.5;
 
@@ -92,6 +95,22 @@ static UIInterfaceOrientation PGDeviceCachedOrientation = UIInterfaceOrientation
 /// 加速度计给出的重力 x 分量。多处跨线程读写，读写本身是 64 位对齐的原子操作，足够用。
 static volatile double PGGravityX = 0.0;
 static volatile BOOL PGGravityValid = NO;
+
+/// 竖屏时块左上角的 y 值：贴着灵动岛/刘海的下沿。
+/// SpringBoard 的窗口上 safeAreaInsets 不一定有值，所以按屏幕高度兜底。
+static CGFloat PGPortraitTopInset(CGRect screenBounds) {
+    CGFloat height = CGRectGetHeight(screenBounds);
+    CGFloat fallback = height >= 812.0 ? 59.0 : 20.0;   // 全面屏（含灵动岛）59，非全面屏 20
+
+    UIEdgeInsets insets = UIEdgeInsetsZero;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+#pragma clang diagnostic pop
+    if (keyWindow && keyWindow.safeAreaInsets.top > 0.0) insets = keyWindow.safeAreaInsets;
+
+    return MAX(insets.top, fallback) + PGLandscapeBarPortraitGap;
+}
 
 static UIInterfaceOrientation PGSpringBoardInterfaceOrientation(void) {
     UIApplication *application = UIApplication.sharedApplication;
@@ -198,12 +217,12 @@ static UIInterfaceOrientation PGResolvedOrientation(void) {
     }
     PGDeviceCachedOrientation = PGInterfaceOrientationFromDevice(device.orientation);
 
-    // 1) 只要加速度计有数据，物理姿态就是最高优先级：手机真的横过来了，就一定显示。
+    // 1) 只要加速度计有数据，物理姿态就是最高优先级，且不做任何"软件源覆盖"：
+    //    手机竖着拿就一定是竖屏（块落在灵动岛下方、不旋转），横过来才算横屏。
+    //    这样竖屏永远不会被 FBS/状态栏带偏而出现歪着显示的块。
     if (PGGravityValid) {
         if (PGGravityX <= -PGLandscapeGravityThreshold) return UIInterfaceOrientationLandscapeLeft;
         if (PGGravityX >= PGLandscapeGravityThreshold) return UIInterfaceOrientationLandscapeRight;
-        // 手机物理上还竖着。但如果系统说前台 App 已经是横屏（强制横屏的播放器），也得跟着显示。
-        if (UIInterfaceOrientationIsLandscape(PGFBSCachedOrientation)) return PGFBSCachedOrientation;
         return UIInterfaceOrientationPortrait;
     }
 
@@ -297,8 +316,8 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 @property (nonatomic, strong, nullable) CMMotionManager *motionManager;
 @property (nonatomic, strong, nullable) NSOperationQueue *motionQueue;
 @property (nonatomic, assign) UIInterfaceOrientation laidOutOrientation;
-/// 承载窗口所在场景的坐标系是否以竖屏为基准。是才需要反向旋转补偿。
-@property (nonatomic, assign) BOOL hostPortraitBase;
+/// 承载窗口的坐标系恒为竖屏基准（SpringBoard 自己的窗口不跟随 App 旋转），
+/// 所以横屏内容一律靠反向旋转补偿，不再根据场景方向分支 —— 那个分支是横屏布局崩掉的原因。
 @property (nonatomic, assign) BOOL motionUnavailable;
 @property (nonatomic, assign) BOOL updating;
 @property (nonatomic, assign) BOOL suspended;
@@ -473,13 +492,12 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     if (preferences.debugForceLandscape) {
         orientation = UIInterfaceOrientationLandscapeLeft;
     }
-    if (!UIInterfaceOrientationIsLandscape(orientation)) {
-        [self hideBar];
-        [self logSnapshotFor:orientation shown:NO note:@"vertical"];
-        return;
-    }
+    // 竖屏也常驻：落在灵动岛/刘海下方居中；横屏落到用户视角的顶边。
     BOOL shown = [self showBarForOrientation:orientation];
-    [self logSnapshotFor:orientation shown:shown note:(shown ? @"show" : @"no-scene")];
+    NSString *note = shown
+        ? (UIInterfaceOrientationIsLandscape(orientation) ? @"show-横屏" : @"show-竖屏")
+        : @"no-window";
+    [self logSnapshotFor:orientation shown:shown note:note];
 }
 
 - (void)logSnapshotFor:(UIInterfaceOrientation)orientation shown:(BOOL)shown note:(NSString *)note {
@@ -514,15 +532,15 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 }
 
 - (BOOL)ensureWindowAndSubviews {
-    UIWindowScene *scene = PGLandscapeHostScene();
-    if (self.window && scene && self.window.windowScene != scene) [self teardownWindow];
+    // 窗口一次建好就不再重建：SpringBoard 的主场景不会销毁，反复 teardown/重建
+    // 只会在横竖切换时闪断。坐标系恒为竖屏基准，与场景方向无关。
     if (self.window) return YES;
 
-    self.hostPortraitBase = scene ? !UIInterfaceOrientationIsLandscape(scene.interfaceOrientation) : YES;
-    CGRect base = self.hostPortraitBase ? UIScreen.mainScreen.bounds : scene.coordinateSpace.bounds;
-    if (CGRectGetWidth(base) <= 0.0 || CGRectGetHeight(base) <= 0.0) base = UIScreen.mainScreen.bounds;
+    // 坐标系恒为竖屏基准（SpringBoard 自己的窗口不跟随 App 旋转），与场景方向无关。
+    CGRect base = UIScreen.mainScreen.bounds;
     if (CGRectGetWidth(base) <= 0.0 || CGRectGetHeight(base) <= 0.0) return NO;
 
+    UIWindowScene *scene = PGLandscapeHostScene();
     PGLandscapeBarWindow *window = nil;
     if (scene) {
         window = [[PGLandscapeBarWindow alloc] initWithWindowScene:scene];
@@ -560,49 +578,56 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     self.bar = bar;
     self.laidOutOrientation = UIInterfaceOrientationUnknown;
 
-    PGLog(@"窗口已创建: scene=%@ portraitBase=%d bounds=%.0fx%.0f level=%.0f",
-          scene ? @"有" : @"无(legacy)", self.hostPortraitBase,
+    PGLog(@"窗口已创建: scene=%@ bounds=%.0fx%.0f level=%.0f",
+          scene ? @"有" : @"无(legacy)",
           CGRectGetWidth(base), CGRectGetHeight(base), window.windowLevel);
     return YES;
 }
 
 - (void)layoutBarForOrientation:(UIInterfaceOrientation)orientation {
-    CGRect bounds = self.window.bounds;
-    CGFloat landscapeWidth = 0.0;
-    CGFloat landscapeHeight = 0.0;
-    if (self.hostPortraitBase) {
-        // 竖屏基准坐标系：内容按横屏尺寸排版，再整体旋转 90° 铺回去。
-        landscapeWidth = MAX(CGRectGetWidth(bounds), CGRectGetHeight(bounds));
-        landscapeHeight = MIN(CGRectGetWidth(bounds), CGRectGetHeight(bounds));
+    CGRect screenBounds = UIScreen.mainScreen.bounds;   // 恒竖屏基准：宽=水平，高=竖直
+    CGFloat screenWidth = CGRectGetWidth(screenBounds);
+    CGFloat screenHeight = CGRectGetHeight(screenBounds);
+    if (screenWidth <= 0.0 || screenHeight <= 0.0) return;
+
+    // 横屏时画布转成横的（932x430），转 90° 后视觉上正好铺满竖屏屏幕。
+    BOOL landscape = UIInterfaceOrientationIsLandscape(orientation);
+    CGFloat canvasWidth = landscape ? screenHeight : screenWidth;
+    CGFloat canvasHeight = landscape ? screenWidth : screenHeight;
+
+    CGSize currentSize = self.rotator.bounds.size;
+    BOOL sizeUnchanged = fabs(currentSize.width - canvasWidth) < 0.5 &&
+                         fabs(currentSize.height - canvasHeight) < 0.5;
+    BOOL windowUnchanged = fabs(CGRectGetWidth(self.window.bounds) - screenWidth) < 0.5;
+    if (self.laidOutOrientation == orientation && sizeUnchanged && windowUnchanged) return;
+
+    self.window.frame = screenBounds;
+    self.rotator.bounds = CGRectMake(0.0, 0.0, canvasWidth, canvasHeight);
+    self.rotator.center = CGPointMake(screenWidth / 2.0, screenHeight / 2.0);
+
+    // 横屏：SpringBoard 自己的窗口不跟着应用转，所以整块内容反向补偿旋转，人眼看到才是正的。
+    // LandscapeLeft = 用户视角的“上”落在物理左边，所以逆时针转 90°。
+    // 竖屏：不转，直接水平排版，落在灵动岛/刘海下方。
+    if (landscape) {
+        BOOL leftEdgeUp = orientation == UIInterfaceOrientationLandscapeLeft;
+        self.rotator.transform = CGAffineTransformMakeRotation(leftEdgeUp ? -M_PI_2 : M_PI_2);
     } else {
-        landscapeWidth = CGRectGetWidth(bounds);
-        landscapeHeight = CGRectGetHeight(bounds);
+        self.rotator.transform = CGAffineTransformIdentity;
     }
-    if (landscapeWidth <= 0.0 || landscapeHeight <= 0.0) return;
 
-    BOOL sizeUnchanged = CGRectGetWidth(self.rotator.bounds) == landscapeWidth &&
-                         CGRectGetHeight(self.rotator.bounds) == landscapeHeight;
-    if (self.laidOutOrientation == orientation && sizeUnchanged) return;
-
-    self.rotator.bounds = CGRectMake(0.0, 0.0, landscapeWidth, landscapeHeight);
-    self.rotator.center = CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
-
-    // SpringBoard 自己的窗口不跟着应用转，所以把整块内容反向补偿旋转，人眼看到才是正的。
-    // LandscapeLeft = 用户视角的“上”落在物理左边，因此逆时针转 90°。
-    BOOL leftEdgeUp = orientation == UIInterfaceOrientationLandscapeLeft;
-    self.rotator.transform = self.hostPortraitBase
-        ? CGAffineTransformMakeRotation(leftEdgeUp ? -M_PI_2 : M_PI_2)
-        : CGAffineTransformIdentity;
-
-    CGSize size = [self.bar preferredContentSizeForMaxWidth:MAX(80.0, landscapeWidth - 48.0)];
-    CGFloat barWidth = MIN(MAX(size.width, 44.0), landscapeWidth - 24.0);
+    CGSize size = [self.bar preferredContentSizeForMaxWidth:MAX(80.0, canvasWidth - 48.0)];
+    CGFloat barWidth = MIN(MAX(size.width, 44.0), canvasWidth - 24.0);
     CGFloat barHeight = MAX(size.height, 20.0);
-    self.bar.frame = CGRectMake((landscapeWidth - barWidth) / 2.0, PGLandscapeBarTopInset, barWidth, barHeight);
+    // 横屏：贴着物理侧边（用户视角的顶边）；竖屏：灵动岛/刘海下方居中。
+    CGFloat top = landscape ? PGLandscapeBarTopInset : PGPortraitTopInset(screenBounds);
+    self.bar.frame = CGRectMake((canvasWidth - barWidth) / 2.0, top, barWidth, barHeight);
     self.laidOutOrientation = orientation;
 
-    PGLog(@"排版: 方向=%ld 画布=%.0fx%.0f 胶囊=%.0fx%.0f 变换=%d",
-          (long)orientation, landscapeWidth, landscapeHeight, barWidth, barHeight,
-          self.hostPortraitBase);
+    PGLog(@"排版: 方向=%ld 画布=%.0fx%.0f 胶囊=%.0fx%.0f(=%.0f,%.0f %.0fx%.0f) 旋转=%d",
+          (long)orientation, canvasWidth, canvasHeight,
+          barWidth, barHeight,
+          CGRectGetMinX(self.bar.frame), CGRectGetMinY(self.bar.frame), barWidth, barHeight,
+          landscape);
 }
 
 - (void)hideBar {
