@@ -11,6 +11,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// 按当前偏好（主开关 + 横屏常驻开关）重算显示状态，并启停轮询。
 - (void)reloadPreferences;
 
+/// 立即按当前方向重算一次显示状态。方向服务回调、设置变更后都走这里。
+- (void)refreshNow;
+
 /// 下拉面板呈现期间临时收起，避免与舌头上的信息重复显示。
 - (void)setSuspended:(BOOL)suspended;
 

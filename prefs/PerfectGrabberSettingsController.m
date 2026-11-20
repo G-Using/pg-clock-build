@@ -165,12 +165,18 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self preferenceNamed:@"启用上滑背景颜色" key:@"EnabledSwipeUpBackgroundColor" defaultValue:@NO cell:PSSwitchCell]];
     [items addObject:[self buttonNamed:@"上滑背景颜色" action:@selector(chooseSwipeUpBackgroundColor)]];
 
+    PSSpecifier *diagnostic = [PSSpecifier groupSpecifierWithName:@"排查"];
+    [diagnostic setProperty:@"横屏看不到块时打开「强制横屏显示」：若块出现，说明方向判定有问题；若仍不出现，说明显示层没生效。诊断日志写在 /var/mobile/Media/PerfectGrabber.log。"
+                   forKey:PSFooterTextGroupKey];
+    [items addObject:diagnostic];
+    [items addObject:[self preferenceNamed:@"强制横屏显示（排查用）" key:@"DebugForceLandscape" defaultValue:@NO cell:PSSwitchCell]];
+
     [items addObject:[PSSpecifier groupSpecifierWithName:@"操作"]];
     [items addObject:[self buttonNamed:@"恢复默认设置" action:@selector(onResetSettings)]];
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-9+roothide35" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-10+roothide36" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;
@@ -257,7 +263,7 @@ static void PGWriteValue(NSString *key, id value) {
 
 - (void)onResetSettings {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
-                      @"Disable24H", @"ChargingIcon",
+                      @"DebugForceLandscape", @"Disable24H", @"ChargingIcon",
                       @"TwoLine", @"TextColor", @"GrabberStyle", @"FontSize", @"FontStyle",
                       @"EnabledBackgroundColor", @"BackgroundColor",
                       @"EnabledSwipeUpBackgroundColor", @"SwipeUpBackgroundColor"];

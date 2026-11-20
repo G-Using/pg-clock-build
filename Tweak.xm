@@ -228,6 +228,12 @@ static void PGPreferencesChanged(CFNotificationCenterRef center, void *observer,
         [PerfectGrabberPreferences.sharedPreferences reload];
         // 横屏常驻块与下拉/上滑无关，加载时就要按当前方向判定一次。
         [PGLandscapeBar.sharedBar reloadPreferences];
+        // dyld 早期 FrontBoardServices / CFPreferences 可能都还没备好，等 SpringBoard 起来后再确认一次。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [PerfectGrabberPreferences.sharedPreferences reload];
+            [PGLandscapeBar.sharedBar reloadPreferences];
+        });
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         PGPreferencesChanged,
                                         (__bridge CFStringRef)PGPreferencesChangedNotification,

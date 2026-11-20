@@ -8,6 +8,7 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
 @property (nonatomic, readwrite) BOOL vibrationFeedback;
 @property (nonatomic, readwrite) BOOL showOnSwipeUp;
 @property (nonatomic, readwrite) BOOL landscapeAlwaysOn;
+@property (nonatomic, readwrite) BOOL debugForceLandscape;
 @property (nonatomic, readwrite) BOOL disable24Hour;
 @property (nonatomic, readwrite) BOOL chargingIcon;
 @property (nonatomic, readwrite) BOOL twoLine;
@@ -68,6 +69,7 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
     self.vibrationFeedback = [[self valueForKey:@"VibrationFeedback" fallback:@YES] boolValue];
     self.showOnSwipeUp = [[self valueForKey:@"ShowOnSwipeUp" fallback:@YES] boolValue];
     self.landscapeAlwaysOn = [[self valueForKey:@"LandscapeAlwaysOn" fallback:@YES] boolValue];
+    self.debugForceLandscape = [[self valueForKey:@"DebugForceLandscape" fallback:@NO] boolValue];
     self.disable24Hour = [[self valueForKey:@"Disable24H" fallback:@NO] boolValue];
     self.chargingIcon = [[self valueForKey:@"ChargingIcon" fallback:@YES] boolValue];
     self.twoLine = [[self valueForKey:@"TwoLine" fallback:@NO] boolValue];
