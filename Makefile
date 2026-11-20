@@ -14,11 +14,12 @@ BUNDLE_NAME = PerfectGrabberSettings
 PerfectGrabberSettings_FILES = prefs/PerfectGrabberSettingsController.m
 PerfectGrabberSettings_INSTALL_PATH = /Library/PreferenceBundles
 PerfectGrabberSettings_FRAMEWORKS = Foundation UIKit
-PerfectGrabberSettings_CFLAGS = -fobjc-arc
-# 注意：不要写 PRIVATE_FRAMEWORKS = Preferences —— iOS SDK 里没有 Preferences.framework 的
-# stub 库（只有头文件），显式 -framework Preferences 会导致 ld: framework not found。
-# PSListController / PSSpecifier 等符号在设备上由 Preferences.framework 运行时提供，
-# bundle 默认的 -undefined dynamic_lookup 足够。
+# -fno-autolink 必须有：#import <Preferences/PSListController.h> 会让 clang modules 自动
+# 生成 LC_LINKER_OPTION "-framework Preferences"，而 iOS SDK 里没有这个 framework 的 stub，
+# ld 直接报 "Could not find or use auto-linked framework 'Preferences'"。
+# 关掉 autolink 后这些符号在设备上由 Preferences.framework 运行时提供（bundle 默认
+# -undefined dynamic_lookup）。Foundation/UIKit 已显式写在 _FRAMEWORKS 里，不受影响。
+PerfectGrabberSettings_CFLAGS = -fobjc-arc -fno-autolink
 PerfectGrabberSettings_RESOURCE_DIRS = prefs/Resources
 
 include $(THEOS_MAKE_PATH)/tweak.mk
