@@ -31,8 +31,10 @@ rewrite_deps() {
   local bin="$1"
   [ -f "$bin" ] || return 0
   chmod 0755 "$bin"
-  local deps
-  deps="$(otool -L "$bin" | tail -n +2 | awk '{print $1}')"
+  # otool -L 第一行是二进制自身的 install name，不能当依赖改写
+  local ownid deps
+  ownid="$(otool -D "$bin" | tail -n +2 | head -n 1 || true)"
+  deps="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -v -x -F "$ownid" || true)"
   local dep
   while IFS= read -r dep; do
     [ -n "$dep" ] || continue
@@ -93,7 +95,10 @@ cat "$ctl"
 # ---------- 4. 签名 + 打包 ----------
 if [ -f "$DYLIB" ]; then "$ldid" -S "$DYLIB"; fi
 if [ -f "$PREFS" ]; then "$ldid" -S "$PREFS"; fi
-dpkg-deb -Zzstd -b "$root" "$dst" || dpkg-deb -b "$root" "$dst"
+# 压缩方式与 rootless 包保持一致（theos 默认 lzma），避免部分设备 dpkg 不支持 zstd。
+# --root-owner-group 必须加：dpkg-deb -R 解包再重打时属主会变成构建用户（runner/staff 501:20），
+# 装到设备上文件属主就错了；加了之后统一为 root:root（iOS 上 gid 0 即 wheel）。
+dpkg-deb -Zlzma --root-owner-group -b "$root" "$dst" || dpkg-deb -Zgzip --root-owner-group -b "$root" "$dst"
 
 # ---------- 5. 自检 ----------
 echo "--- 架构 ---"
