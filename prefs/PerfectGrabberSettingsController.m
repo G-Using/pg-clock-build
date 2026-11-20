@@ -176,7 +176,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-11+roothide37" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-12+roothide38" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;

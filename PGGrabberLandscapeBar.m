@@ -313,6 +313,7 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 @property (nonatomic, strong, nullable) UIView *rotator;
 @property (nonatomic, strong, nullable) PGLandscapeBarView *bar;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
+@property (nonatomic, strong, nullable) NSTimer *suspendTimer;
 @property (nonatomic, strong, nullable) CMMotionManager *motionManager;
 @property (nonatomic, strong, nullable) NSOperationQueue *motionQueue;
 @property (nonatomic, assign) UIInterfaceOrientation laidOutOrientation;
@@ -367,6 +368,10 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     self.active = preferences.isEnabled && preferences.landscapeAlwaysOn;
     // 设置可能改了字号/配色，强制下一次重新排版。
     self.laidOutOrientation = UIInterfaceOrientationUnknown;
+    // 设置变更是一次干净的重新开始：清掉可能残留的暂停标记和计时器。
+    [self.suspendTimer invalidate];
+    self.suspendTimer = nil;
+    self.suspended = NO;
 
     PGLog(@"reload: enabled=%d landscapeAlwaysOn=%d debugForce=%d → active=%d",
           preferences.isEnabled, preferences.landscapeAlwaysOn,
@@ -387,8 +392,32 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         });
         return;
     }
-    if (_suspended == suspended) return;
+    [self.suspendTimer invalidate];
+    self.suspendTimer = nil;
+
+    if (suspended == _suspended && !suspended) {
+        [self refreshNow];
+        return;
+    }
     _suspended = suspended;
+
+    if (suspended) {
+        // 兜底：SBGrabberTongue 的 _willDismiss 未必总被调用（手势取消、被系统打断等），
+        // 一旦漏掉这个标记就会永久处于"暂停"状态、横竖屏都不显示。3 秒后强制恢复。
+        __weak typeof(self) weakSelf = self;
+        NSTimer *timer = [NSTimer timerWithTimeInterval:3.0
+                                               repeats:NO
+                                                 block:^(NSTimer *fireTimer) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (!strongSelf->_suspended) return;
+            PGLog(@"suspended 超时，强制恢复显示");
+            strongSelf->_suspended = NO;
+            [strongSelf refreshNow];
+        }];
+        self.suspendTimer = timer;
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    }
     [self refreshNow];
 }
 
