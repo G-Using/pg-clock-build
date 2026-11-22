@@ -8,6 +8,9 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
 @property (nonatomic, readwrite) BOOL vibrationFeedback;
 @property (nonatomic, readwrite) BOOL showOnSwipeUp;
 @property (nonatomic, readwrite) BOOL landscapeAlwaysOn;
+@property (nonatomic, readwrite) BOOL landscapeMusic;
+@property (nonatomic, readwrite) BOOL landscapeCustomBackground;
+@property (nonatomic, readwrite) UIColor *landscapeBackgroundColor;
 @property (nonatomic, readwrite) BOOL disable24Hour;
 @property (nonatomic, readwrite) BOOL chargingIcon;
 @property (nonatomic, readwrite) BOOL twoLine;
@@ -81,6 +84,11 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
     self.vibrationFeedback = [[self valueForKey:@"VibrationFeedback" fallback:@YES] boolValue];
     self.showOnSwipeUp = [[self valueForKey:@"ShowOnSwipeUp" fallback:@YES] boolValue];
     self.landscapeAlwaysOn = [[self valueForKey:@"LandscapeAlwaysOn" fallback:@YES] boolValue];
+    self.landscapeMusic = [[self valueForKey:@"LandscapeMusic" fallback:@YES] boolValue];
+    self.landscapeCustomBackground = [[self valueForKey:@"LandscapeCustomBackground" fallback:@NO] boolValue];
+    self.landscapeBackgroundColor =
+        [PerfectGrabberPreferences colorFromHexString:[self valueForKey:@"LandscapeBackgroundColor" fallback:@"#00BFFF"]
+                                             fallback:[UIColor colorWithRed:0 green:0.75 blue:1 alpha:1]];
     self.disable24Hour = [[self valueForKey:@"Disable24H" fallback:@NO] boolValue];
     self.chargingIcon = [[self valueForKey:@"ChargingIcon" fallback:@YES] boolValue];
     self.twoLine = [[self valueForKey:@"TwoLine" fallback:@NO] boolValue];

@@ -1,8 +1,8 @@
 Package: com.netskao.perfectgrabber
 Name: Ntonia-PreferenceLoader
-Version: 1.1-17
+Version: 1.1-18
 Architecture: iphoneos-arm64
-Description: 横屏游戏时自动常驻显示时间与电量，无需下拉；同时保留下拉显示和上滑 HUD，支持自定义字体、字号、文字颜色、背景颜色、布局样式、震动反馈等
+Description: 横屏游戏时自动常驻显示时间与电量（单排），支持自定义背景色；后台听歌时显示歌名并可点按切换/暂停、上一首下一首
 Maintainer: Huayuarc
 Author: NetSkao
 Section: Tweaks

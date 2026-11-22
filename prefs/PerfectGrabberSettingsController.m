@@ -165,17 +165,25 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self preferenceNamed:@"启用上滑背景颜色" key:@"EnabledSwipeUpBackgroundColor" defaultValue:@NO cell:PSSwitchCell]];
     [items addObject:[self buttonNamed:@"上滑背景颜色" action:@selector(chooseSwipeUpBackgroundColor)]];
 
-    PSSpecifier *nospec = [PSSpecifier groupSpecifierWithName:@"横屏块位置"];
-    [nospec setProperty:@"横屏时时间电量块固定显示在屏幕最上方、水平居中；竖屏时自动隐藏。"
-                 forKey:PSFooterTextGroupKey];
-    [items addObject:nospec];
+    PSSpecifier *landscape = [PSSpecifier groupSpecifierWithName:@"横屏块"];
+    [landscape setProperty:@"横屏块固定单排显示（时间 + 电量在同一行），贴在屏幕最上方居中；竖屏自动隐藏。"
+                    forKey:PSFooterTextGroupKey];
+    [items addObject:landscape];
+    [items addObject:[self preferenceNamed:@"显示正在播放的音乐" key:@"LandscapeMusic" defaultValue:@YES cell:PSSwitchCell]];
+    [items addObject:[self preferenceNamed:@"横屏块自定义背景色" key:@"LandscapeCustomBackground" defaultValue:@NO cell:PSSwitchCell]];
+    [items addObject:[self buttonNamed:@"横屏块背景颜色" action:@selector(chooseLandscapeBackgroundColor)]];
+
+    PSSpecifier *musicFooter = [PSSpecifier groupSpecifierWithName:@"播放控制"];
+    [musicFooter setProperty:@"边玩游戏边听歌时，横屏块会接上「♪ 歌名 · 歌手」。点一下横屏块弹出控制面板：上一首 / 播放暂停 / 下一首，6 秒无操作自动收起；再点一下也能收起。"
+                       forKey:PSFooterTextGroupKey];
+    [items addObject:musicFooter];
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"操作"]];
     [items addObject:[self buttonNamed:@"恢复默认设置" action:@selector(onResetSettings)]];
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-17" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-18" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;
@@ -235,6 +243,14 @@ static void PGWriteValue(NSString *key, id value) {
                        fallback:[UIColor colorWithRed:0 green:0.68 blue:1 alpha:1]];
 }
 
+/// 选横屏块专属背景色时顺手把开关打开 —— 否则用户挑完颜色却看不出任何变化。
+- (void)chooseLandscapeBackgroundColor {
+    PGWriteValue(@"LandscapeCustomBackground", @YES);
+    [self reloadSpecifiers];
+    [self showColorPickerForKey:@"LandscapeBackgroundColor"
+                       fallback:[UIColor colorWithRed:0 green:0.75 blue:1 alpha:1]];
+}
+
 - (void)storeSelectedColor:(UIColor *)color {
     if (!self.activeColorKey.length) return;
     CFPreferencesSetAppValue((__bridge CFStringRef)self.activeColorKey,
@@ -262,6 +278,7 @@ static void PGWriteValue(NSString *key, id value) {
 
 - (void)onResetSettings {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
+                      @"LandscapeMusic", @"LandscapeCustomBackground", @"LandscapeBackgroundColor",
                       @"Disable24H", @"ChargingIcon",
                       @"TwoLine", @"TextColor", @"GrabberStyle", @"FontSize", @"FontStyle",
                       @"EnabledBackgroundColor", @"BackgroundColor",

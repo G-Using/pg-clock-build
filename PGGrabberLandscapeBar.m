@@ -1,7 +1,9 @@
 #import "PGGrabberLandscapeBar.h"
 #import "PGGrabberOverlayView.h"
 #import "PerfectGrabberPreferences.h"
+#import "PGNowPlaying.h"
 #import <QuartzCore/QuartzCore.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <CoreMotion/CoreMotion.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <dlfcn.h>
@@ -87,6 +89,15 @@ static void PGLogLine(NSString *message) {
 }
 
 static void PGLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    PGLogLine(message);
+}
+
+/// 其它编译单元（PGNowPlaying）复用同一份日志文件。
+void PGDebugLog(NSString *format, ...) {
     va_list args;
     va_start(args, format);
     NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
@@ -278,15 +289,131 @@ static BOOL PGStartFBSObserver(void) {
     if (self) {
         self.clipsToBounds = YES;
         self.layer.cornerRadius = 10.0;
+        // 横屏块恒单排：时间、电量、（音乐）全在一条线上。
+        self.forceSingleLine = YES;
+        // 需要接受点按（点一下弹播放控制面板），子标签自己不拦触摸。
+        self.userInteractionEnabled = YES;
     }
     return self;
 }
 
 - (void)applyAppearance {
+    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
+    self.backgroundOverrideColor = preferences.landscapeCustomBackground
+        ? preferences.landscapeBackgroundColor
+        : nil;
     [super applyAppearance];
     self.layer.cornerRadius = 10.0;
     self.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner |
                                kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
+}
+
+@end
+
+#pragma mark - 播放控制面板
+
+/// 点一下胶囊弹出来的小面板：上一首 / 播放暂停 / 下一首。
+@interface PGLandscapeControlPanel : UIView
+@property (nonatomic, copy, nullable) void (^onPrevious)(void);
+@property (nonatomic, copy, nullable) void (^onToggle)(void);
+@property (nonatomic, copy, nullable) void (^onNext)(void);
+- (void)updateTitle:(nullable NSString *)title artist:(nullable NSString *)artist playing:(BOOL)playing;
+@end
+
+@implementation PGLandscapeControlPanel {
+    UILabel *_titleLabel;
+    UILabel *_subtitleLabel;
+    UIButton *_previousButton;
+    UIButton *_toggleButton;
+    UIButton *_nextButton;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.userInteractionEnabled = YES;
+        self.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
+        self.layer.cornerRadius = 18.0;
+        self.layer.cornerCurve = kCACornerCurveContinuous;
+        self.layer.borderWidth = 1.0 / MAX(UIScreen.mainScreen.scale, 1.0);
+        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.12].CGColor;
+        self.clipsToBounds = NO;
+
+        _titleLabel = [UILabel new];
+        _titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold];
+        _titleLabel.textColor = UIColor.whiteColor;
+        _titleLabel.textAlignment = NSTextAlignmentCenter;
+        _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        [self addSubview:_titleLabel];
+
+        _subtitleLabel = [UILabel new];
+        _subtitleLabel.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightRegular];
+        _subtitleLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+        _subtitleLabel.textAlignment = NSTextAlignmentCenter;
+        _subtitleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        [self addSubview:_subtitleLabel];
+
+        _previousButton = [self buttonWithSymbol:@"backward.fill" action:@selector(tappedPrevious)];
+        _toggleButton = [self buttonWithSymbol:@"play.fill" action:@selector(tappedToggle)];
+        _nextButton = [self buttonWithSymbol:@"forward.fill" action:@selector(tappedNext)];
+        _toggleButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
+        _toggleButton.layer.cornerRadius = 23.0;
+
+        for (UIButton *button in @[_previousButton, _toggleButton, _nextButton]) {
+            [self addSubview:button];
+        }
+    }
+    return self;
+}
+
+- (UIButton *)buttonWithSymbol:(NSString *)symbol action:(SEL)action {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    if (@available(iOS 13.0, *)) {
+        UIImage *image = [UIImage systemImageNamed:symbol];
+        [button setImage:image forState:UIControlStateNormal];
+        button.tintColor = UIColor.whiteColor;
+    }
+    button.imageView.contentMode = UIViewContentModeScaleAspectFit;
+    [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return button;
+}
+
+- (void)updateTitle:(NSString *)title artist:(NSString *)artist playing:(BOOL)playing {
+    _titleLabel.text = title.length ? title : @"正在播放";
+    _subtitleLabel.text = artist.length ? artist : @"";
+    if (@available(iOS 13.0, *)) {
+        [_toggleButton setImage:[UIImage systemImageNamed:playing ? @"pause.fill" : @"play.fill"]
+                       forState:UIControlStateNormal];
+    }
+}
+
+- (void)tappedPrevious {
+    if (self.onPrevious) self.onPrevious();
+}
+
+- (void)tappedToggle {
+    if (self.onToggle) self.onToggle();
+}
+
+- (void)tappedNext {
+    if (self.onNext) self.onNext();
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat width = CGRectGetWidth(self.bounds);
+    _titleLabel.frame = CGRectMake(14.0, 10.0, width - 28.0, 18.0);
+    _subtitleLabel.frame = CGRectMake(14.0, 29.0, width - 28.0, 14.0);
+
+    CGFloat size = 46.0;
+    CGFloat gap = 24.0;
+    CGFloat total = size * 3.0 + gap * 2.0;
+    CGFloat originX = (width - total) / 2.0;
+    CGFloat originY = CGRectGetHeight(self.bounds) - size - 10.0;
+    _previousButton.frame = CGRectMake(originX, originY, size, size);
+    _toggleButton.frame = CGRectMake(originX + size + gap, originY, size, size);
+    _nextButton.frame = CGRectMake(originX + (size + gap) * 2.0, originY, size, size);
+    _toggleButton.layer.cornerRadius = size / 2.0;
 }
 
 @end
@@ -312,8 +439,10 @@ static BOOL PGStartFBSObserver(void) {
 
 @end
 
-/// 只负责显示、永不抢焦点：常驻块必须完全穿透触摸。
+/// 显示 + 只放行胶囊和面板上的触摸，其它位置全部穿透给底下的游戏。
 @interface PGLandscapeBarWindow : UIWindow
+@property (nonatomic, weak, nullable) UIView *barHitArea;
+@property (nonatomic, weak, nullable) UIView *panelHitArea;
 @end
 
 @implementation PGLandscapeBarWindow
@@ -324,6 +453,22 @@ static BOOL PGStartFBSObserver(void) {
 
 - (BOOL)canBecomeFocused {
     return NO;
+}
+
+/// 这个窗口铺满全屏，如果正常参与命中测试会把游戏的触摸全部吃掉。
+/// 只把落在胶囊 / 控制面板里的点交出去，其余返回 nil —— UIKit 会继续往下层窗口投递。
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.hidden) return nil;
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (!hit || hit == self) return nil;
+
+    UIView *bar = self.barHitArea;
+    if (bar && !bar.hidden && [hit isDescendantOfView:bar]) return hit;
+
+    UIView *panel = self.panelHitArea;
+    if (panel && !panel.hidden && panel.superview && [hit isDescendantOfView:panel]) return hit;
+
+    return nil;
 }
 
 @end
@@ -384,6 +529,13 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 @property (nonatomic, copy) NSString *resolvedSource;
 @property (nonatomic, copy, nullable) NSString *lastSnapshot;
 
+/// 点一下胶囊弹出的播放控制面板。
+@property (nonatomic, strong, nullable) PGLandscapeControlPanel *panel;
+@property (nonatomic, assign) BOOL panelVisible;
+@property (nonatomic, strong, nullable) NSTimer *panelTimer;
+/// 是否已经在监听系统"正在播放"。
+@property (nonatomic, assign) BOOL musicMonitoring;
+
 @end
 
 @implementation PGLandscapeBar
@@ -436,8 +588,115 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         PGStartFBSObserver();
         [self startMotionUpdatesIfNeeded];
         [self startPolling];
+        [self startMusicMonitoring];
     }
     [self refreshNow];
+}
+
+#pragma mark 音乐
+
+- (void)startMusicMonitoring {
+    if (self.musicMonitoring) return;
+    self.musicMonitoring = YES;
+    PGNowPlaying *nowPlaying = PGNowPlaying.sharedInstance;
+    __weak typeof(self) weakSelf = self;
+    nowPlaying.onChange = ^(PGNowPlaying *item) {
+        [weakSelf applyNowPlaying:item];
+    };
+    [nowPlaying startMonitoring];
+}
+
+/// 决定胶囊里要不要带音乐信息。
+/// 判定条件：开关打开 + 确实在播 + 有歌名/歌手 + 播放的 App 不是当前前台 App
+/// （前台自己在放视频/音乐时不该再显示一遍，那正是全屏看片会误弹的原因）。
+- (void)applyNowPlaying:(PGNowPlaying *)item {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self applyNowPlaying:item];
+        });
+        return;
+    }
+    if (!self.bar) return;
+
+    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
+    NSString *playingApp = item.bundleIdentifier;
+    NSString *frontApp = item.frontmostBundleIdentifier;
+    BOOL inBackground = playingApp.length == 0 || frontApp.length == 0 ||
+                        ![playingApp isEqualToString:frontApp];
+    BOOL hasText = item.title.length > 0 || item.artist.length > 0;
+    BOOL visible = preferences.landscapeMusic && item.isPlaying && hasText && inBackground;
+
+    [self.bar setMusicVisible:visible
+                        title:item.title
+                       artist:item.artist
+                      playing:item.isPlaying];
+    if (visible) {
+        [self.panel updateTitle:item.title artist:item.artist playing:item.isPlaying];
+    } else if (self.panelVisible) {
+        [self hidePanel];
+    }
+}
+
+- (void)handleBarTap:(UITapGestureRecognizer *)recognizer {
+    if (self.panelVisible) {
+        [self hidePanel];
+        return;
+    }
+    if (!self.bar.musicVisible) return;   // 没在放歌就别弹面板
+    [self showPanel];
+}
+
+- (void)showPanel {
+    if (!self.panel || self.panelVisible) return;
+    if (self.window.bounds.size.width <= self.window.bounds.size.height) return;   // 仅横屏空间可用
+
+    PGNowPlaying *nowPlaying = PGNowPlaying.sharedInstance;
+    [self.panel updateTitle:nowPlaying.title artist:nowPlaying.artist playing:nowPlaying.isPlaying];
+
+    self.panelVisible = YES;
+    self.panel.hidden = NO;
+    self.panel.alpha = 0.0;
+    [self placePanelInSpace:self.window.bounds];
+    [UIView animateWithDuration:0.16
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        self.panel.alpha = 1.0;
+    } completion:nil];
+
+    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
+    if (preferences.vibrationFeedback) AudioServicesPlaySystemSound(1519);
+    [self schedulePanelHide];
+}
+
+- (void)hidePanel {
+    [self.panelTimer invalidate];
+    self.panelTimer = nil;
+    if (!self.panelVisible) return;
+    self.panelVisible = NO;
+    [self.panel.layer removeAllAnimations];
+    self.panel.hidden = YES;
+    self.panel.alpha = 1.0;
+}
+
+/// 面板不点也会自己收起，免得挡住游戏画面。
+- (void)schedulePanelHide {
+    [self.panelTimer invalidate];
+    __weak typeof(self) weakSelf = self;
+    NSTimer *timer = [NSTimer timerWithTimeInterval:6.0
+                                           repeats:NO
+                                             block:^(NSTimer *fireTimer) {
+        [weakSelf hidePanel];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    self.panelTimer = timer;
+}
+
+- (void)sendMediaCommand:(PGMediaCommand)command {
+    [PGNowPlaying.sharedInstance sendCommand:command];
+    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
+    if (preferences.vibrationFeedback) AudioServicesPlaySystemSound(1519);
+    [self schedulePanelHide];
 }
 
 - (void)setSuspended:(BOOL)suspended {
@@ -749,7 +1008,8 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     // 系统自带 HUD 都是这个量级，照抄才不会"窗口建好了但看不见"。
     window.windowLevel = UIWindowLevelAlert + 1000000.0;
     window.backgroundColor = UIColor.clearColor;
-    window.userInteractionEnabled = NO;
+    // 窗口本身要收触摸（胶囊 / 面板），由 hitTest 保证其它位置全部穿透。
+    window.userInteractionEnabled = YES;
     window.accessibilityElementsHidden = YES;
     window.hidden = YES;
 
@@ -757,7 +1017,7 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     PGLandscapeHostView *host = [[PGLandscapeHostView alloc] initWithFrame:window.bounds];
     host.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     host.backgroundColor = UIColor.clearColor;
-    host.userInteractionEnabled = NO;
+    host.userInteractionEnabled = YES;
     host.bar = self;
 
     UIViewController *controller = [[UIViewController alloc] init];
@@ -766,13 +1026,39 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 
     PGLandscapeBarView *bar = [[PGLandscapeBarView alloc] initWithFrame:CGRectZero];
     bar.hidden = YES;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                         action:@selector(handleBarTap:)];
+    [bar addGestureRecognizer:tap];
     [host addSubview:bar];
+
+    PGLandscapeControlPanel *panel = [[PGLandscapeControlPanel alloc] initWithFrame:CGRectZero];
+    panel.hidden = YES;
+    __weak typeof(self) weakSelf = self;
+    panel.onPrevious = ^{ [weakSelf sendMediaCommand:PGMediaCommandPrevious]; };
+    panel.onToggle = ^{ [weakSelf sendMediaCommand:PGMediaCommandTogglePlayPause]; };
+    panel.onNext = ^{ [weakSelf sendMediaCommand:PGMediaCommandNext]; };
+    [host addSubview:panel];
+
+    window.barHitArea = bar;
+    window.panelHitArea = panel;
+
+    // 歌名长短变化会改变胶囊宽度，通知宿主立刻重排（否则要等下一次方向轮询）。
+    bar.contentWidthDidChange = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.visible) return;
+        strongSelf.laidOut = NO;
+        [strongSelf layoutBarLeftEdgeUp:strongSelf.anchorLeftEdgeUp];
+    };
 
     self.window = window;
     self.bar = bar;
+    self.panel = panel;
     self.laidOut = NO;
     self.barLength = 0.0;
     self.barThickness = 0.0;
+
+    // 窗口刚建好时音乐可能已经在放了，先把当前状态同步进来。
+    [self applyNowPlaying:PGNowPlaying.sharedInstance];
 
     PGLog(@"窗口已创建: scene=%@ bounds=%.0fx%.0f level=%.0f",
           scene ? @"有" : @"无(legacy)",
@@ -841,6 +1127,27 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         self.bar.center = CGPointMake(centerX, spaceHeight / 2.0);
         self.bar.transform = CGAffineTransformMakeRotation(leftSide ? -M_PI_2 : M_PI_2);
     }
+
+    [self placePanelInSpace:space];
+}
+
+/// 面板挨着胶囊下沿居中摆放。竖屏坐标系里不做（旋转瞬间不显示面板，避免旋转补偿把面板甩到屏幕外）。
+- (void)placePanelInSpace:(CGRect)space {
+    if (!self.panel) return;
+    CGFloat spaceWidth = CGRectGetWidth(space);
+    CGFloat spaceHeight = CGRectGetHeight(space);
+    if (spaceWidth <= spaceHeight) {
+        self.panel.hidden = YES;
+        return;
+    }
+
+    CGFloat panelWidth = MIN(272.0, MAX(160.0, spaceWidth - 60.0));
+    CGFloat panelHeight = 104.0;
+    self.panel.transform = CGAffineTransformIdentity;
+    self.panel.bounds = CGRectMake(0.0, 0.0, panelWidth, panelHeight);
+
+    CGFloat barBottom = self.bar ? CGRectGetMaxY(self.bar.frame) : 30.0;
+    self.panel.center = CGPointMake(spaceWidth / 2.0, barBottom + 10.0 + panelHeight / 2.0);
 }
 
 - (void)hideBar {
@@ -848,6 +1155,7 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         [self.bar stopUpdating];
         self.updating = NO;
     }
+    [self hidePanel];
     [self.bar.layer removeAllAnimations];
     self.bar.alpha = 1.0;
     self.bar.hidden = YES;
@@ -866,6 +1174,8 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     self.window.rootViewController = nil;
     self.window = nil;
     self.bar = nil;
+    self.panel = nil;
+    self.panelVisible = NO;
     self.laidOut = NO;
     self.visible = NO;
 }

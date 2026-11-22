@@ -6,8 +6,9 @@ INSTALL_TARGET_PROCESSES = SpringBoard Preferences
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = PerfectGrabber
-PerfectGrabber_FILES = Tweak.xm PerfectGrabberPreferences.m PGGrabberOverlayView.m PGGrabberHUDView.m PGGrabberLandscapeBar.m
+PerfectGrabber_FILES = Tweak.xm PerfectGrabberPreferences.m PGGrabberOverlayView.m PGGrabberHUDView.m PGGrabberLandscapeBar.m PGNowPlaying.m
 PerfectGrabber_CFLAGS = -fobjc-arc
+# MediaRemote 走 dlopen/dlsym 运行时加载，不写进 FRAMEWORKS（SDK 里没有它的 stub）。
 PerfectGrabber_FRAMEWORKS = Foundation UIKit AudioToolbox CoreMotion
 
 BUNDLE_NAME = PerfectGrabberSettings
