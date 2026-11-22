@@ -224,7 +224,8 @@ static void PGPreferencesChanged(CFNotificationCenterRef center, void *observer,
 
 #pragma mark - 启动时机与崩溃守卫
 
-extern void PGDebugLog(NSString *format, ...);
+// .xm 是按 Objective-C++ 编的，这里必须 extern "C"，否则会被按 C++ 名字改写去找。
+extern "C" void PGDebugLog(NSString *format, ...);
 
 /// 启动标记文件。存在 = 上一次 SpringBoard 在启动流程走完之前就死了，
 /// 那基本就是本插件的启动路径把它带下来的（就是安全模式）。
