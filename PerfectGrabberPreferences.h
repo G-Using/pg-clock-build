@@ -14,6 +14,8 @@ FOUNDATION_EXPORT NSString *const PGPreferencesChangedNotification;
 @property (nonatomic, readonly) BOOL landscapeAlwaysOn;
 /// 横屏块是否附带"正在播放的音乐"信息（前台是游戏/别的 App、后台在放歌时）。
 @property (nonatomic, readonly) BOOL landscapeMusic;
+/// 时间前面是否加"CPU 频率 + 电池温度"。
+@property (nonatomic, readonly) BOOL landscapeMetrics;
 /// 横屏块使用独立的自定义背景色，不再跟随上面那组"背景"设置。
 @property (nonatomic, readonly) BOOL landscapeCustomBackground;
 @property (nonatomic, readonly) UIColor *landscapeBackgroundColor;

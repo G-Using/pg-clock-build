@@ -27,6 +27,11 @@ typedef NS_ENUM(NSInteger, PGMediaCommand) {
 @property (nonatomic, copy, readonly, nullable) NSString *bundleIdentifier;
 /// 当前前台 App。和上一项不同就说明音乐在后台放 —— 也就是"玩游戏在听歌"。
 @property (nonatomic, copy, readonly, nullable) NSString *frontmostBundleIdentifier;
+/// 播放进度（秒）与总时长（秒）。取不到就是 0，面板会自己把进度条藏起来。
+@property (nonatomic, readonly) double elapsed;
+@property (nonatomic, readonly) double duration;
+/// 封面图原始数据（MPNowPlayingInfo 里的 ArtworkData），可能为 nil。
+@property (nonatomic, copy, readonly, nullable) NSData *artworkData;
 /// 状态变化回调，主线程调用。
 @property (nonatomic, copy, nullable) void (^onChange)(PGNowPlaying *nowPlaying);
 

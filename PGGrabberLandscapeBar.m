@@ -7,6 +7,7 @@
 #import <CoreMotion/CoreMotion.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <dlfcn.h>
+#import <objc/message.h>
 #import <math.h>
 #import <stdarg.h>
 #import <stdio.h>
@@ -327,80 +328,294 @@ static BOOL PGStartFBSObserver(void) {
 
 #pragma mark - 播放控制面板
 
-/// 点一下胶囊弹出来的小面板：上一首 / 播放暂停 / 下一首。
+/// 点一下胶囊弹出来的播放面板：毛玻璃卡片 + 封面 + 歌名/歌手 + 进度条 + 上一首/播放暂停/下一首。
 @interface PGLandscapeControlPanel : UIView
 @property (nonatomic, copy, nullable) void (^onPrevious)(void);
 @property (nonatomic, copy, nullable) void (^onToggle)(void);
 @property (nonatomic, copy, nullable) void (^onNext)(void);
-- (void)updateTitle:(nullable NSString *)title artist:(nullable NSString *)artist playing:(BOOL)playing;
+@property (nonatomic, copy, nullable) void (^onOpenApplication)(void);
+- (void)updateTitle:(nullable NSString *)title
+             artist:(nullable NSString *)artist
+            playing:(BOOL)playing
+            elapsed:(double)elapsed
+           duration:(double)duration
+        artworkData:(nullable NSData *)artworkData
+         canOpenApp:(BOOL)canOpenApp;
 @end
 
+/// 面板内边距。
+static const CGFloat PGPanelPadding = 16.0;
+/// 封面边长。
+static const CGFloat PGPanelArtworkSize = 76.0;
+/// 面板高度（宽度按屏幕给，见 placePanelInSpace:）。
+static const CGFloat PGPanelHeight = 200.0;
+
 @implementation PGLandscapeControlPanel {
+    UIVisualEffectView *_blurView;
+    UIImageView *_artworkView;
     UILabel *_titleLabel;
     UILabel *_subtitleLabel;
+    UILabel *_elapsedLabel;
+    UILabel *_remainingLabel;
+    UIView *_progressTrack;
+    UIView *_progressFill;
+    CAGradientLayer *_progressGradient;
     UIButton *_previousButton;
     UIButton *_toggleButton;
     UIButton *_nextButton;
+    UIButton *_openButton;
+
+    /// 进度条的锚点：MediaRemote 的 elapsed 只按秒级更新，两次更新之间用本地时钟补齐，
+    /// 否则进度条是一秒一跳。只有"漂移超过 0.75 秒"或"暂停/换曲"才重新对齐。
+    double _anchorElapsed;
+    double _duration;
+    BOOL _playing;
+    CFTimeInterval _anchorTime;
+    NSTimer *_tickTimer;
+    NSData *_lastArtworkData;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
         self.userInteractionEnabled = YES;
-        self.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
-        self.layer.cornerRadius = 18.0;
+        self.backgroundColor = UIColor.clearColor;
+        self.layer.cornerRadius = 22.0;
         self.layer.cornerCurve = kCACornerCurveContinuous;
+        self.clipsToBounds = YES;
         self.layer.borderWidth = 1.0 / MAX(UIScreen.mainScreen.scale, 1.0);
-        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.12].CGColor;
-        self.clipsToBounds = NO;
+        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.16].CGColor;
+
+        // 毛玻璃：薄材质深色，背后游戏的色彩会透上来但压暗，文字才看得清。
+        UIBlurEffect *effect = nil;
+        if (@available(iOS 13.0, *)) {
+            effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark];
+        } else {
+            effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
+        }
+        _blurView = [[UIVisualEffectView alloc] initWithEffect:effect];
+        _blurView.userInteractionEnabled = NO;
+        [self addSubview:_blurView];
+
+        _artworkView = [UIImageView new];
+        _artworkView.contentMode = UIViewContentModeScaleAspectFill;
+        _artworkView.clipsToBounds = YES;
+        _artworkView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+        _artworkView.layer.cornerCurve = kCACornerCurveContinuous;
+        if (@available(iOS 13.0, *)) {
+            _artworkView.image = [UIImage systemImageNamed:@"music.note"];
+            _artworkView.tintColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+            _artworkView.contentMode = UIViewContentModeCenter;
+        }
+        [self addSubview:_artworkView];
 
         _titleLabel = [UILabel new];
-        _titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold];
+        _titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
         _titleLabel.textColor = UIColor.whiteColor;
-        _titleLabel.textAlignment = NSTextAlignmentCenter;
         _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
         [self addSubview:_titleLabel];
 
         _subtitleLabel = [UILabel new];
-        _subtitleLabel.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightRegular];
-        _subtitleLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
-        _subtitleLabel.textAlignment = NSTextAlignmentCenter;
+        _subtitleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular];
+        _subtitleLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
         _subtitleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
         [self addSubview:_subtitleLabel];
 
-        _previousButton = [self buttonWithSymbol:@"backward.fill" action:@selector(tappedPrevious)];
-        _toggleButton = [self buttonWithSymbol:@"play.fill" action:@selector(tappedToggle)];
-        _nextButton = [self buttonWithSymbol:@"forward.fill" action:@selector(tappedNext)];
-        _toggleButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
-        _toggleButton.layer.cornerRadius = 23.0;
+        _elapsedLabel = [self timeLabelWithAlignment:NSTextAlignmentLeft];
+        _remainingLabel = [self timeLabelWithAlignment:NSTextAlignmentRight];
+        [self addSubview:_elapsedLabel];
+        [self addSubview:_remainingLabel];
 
-        for (UIButton *button in @[_previousButton, _toggleButton, _nextButton]) {
+        _progressTrack = [UIView new];
+        _progressTrack.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.26];
+        _progressTrack.clipsToBounds = YES;
+        [self addSubview:_progressTrack];
+
+        _progressFill = [UIView new];
+        _progressGradient = [CAGradientLayer layer];
+        _progressGradient.colors = @[(__bridge id)[UIColor colorWithWhite:1.0 alpha:0.98].CGColor,
+                                     (__bridge id)[UIColor colorWithRed:1.0 green:0.70 blue:0.42 alpha:1.0].CGColor];
+        _progressGradient.startPoint = CGPointMake(0.0, 0.5);
+        _progressGradient.endPoint = CGPointMake(1.0, 0.5);
+        [_progressFill.layer addSublayer:_progressGradient];
+        [_progressTrack addSubview:_progressFill];
+
+        _previousButton = [self buttonWithSymbol:@"backward.fill" pointSize:20.0 action:@selector(tappedPrevious)];
+        _nextButton = [self buttonWithSymbol:@"forward.fill" pointSize:20.0 action:@selector(tappedNext)];
+        _toggleButton = [self buttonWithSymbol:@"play.fill" pointSize:26.0 action:@selector(tappedToggle)];
+        _toggleButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.18];
+        _openButton = [self buttonWithSymbol:@"arrow.up.forward.app.fill" pointSize:18.0
+                                     action:@selector(tappedOpen)];
+        _openButton.tintColor = [UIColor colorWithWhite:1.0 alpha:0.85];
+
+        for (UIButton *button in @[_previousButton, _toggleButton, _nextButton, _openButton]) {
             [self addSubview:button];
         }
     }
     return self;
 }
 
-- (UIButton *)buttonWithSymbol:(NSString *)symbol action:(SEL)action {
+- (void)dealloc {
+    [_tickTimer invalidate];
+}
+
+#pragma mark 控件构造
+
+- (UILabel *)timeLabelWithAlignment:(NSTextAlignment)alignment {
+    UILabel *label = [UILabel new];
+    label.font = [UIFont monospacedDigitSystemFontOfSize:12.0 weight:UIFontWeightMedium];
+    label.textColor = [UIColor colorWithWhite:1.0 alpha:0.85];
+    label.textAlignment = alignment;
+    label.adjustsFontSizeToFitWidth = YES;
+    label.minimumScaleFactor = 0.8;
+    return label;
+}
+
+- (UIButton *)buttonWithSymbol:(NSString *)symbol
+                     pointSize:(CGFloat)pointSize
+                        action:(SEL)action {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     if (@available(iOS 13.0, *)) {
-        UIImage *image = [UIImage systemImageNamed:symbol];
+        UIImageSymbolConfiguration *configuration =
+            [UIImageSymbolConfiguration configurationWithPointSize:pointSize weight:UIFontWeightSemibold];
+        UIImage *image = [UIImage systemImageNamed:symbol withConfiguration:configuration];
         [button setImage:image forState:UIControlStateNormal];
         button.tintColor = UIColor.whiteColor;
     }
-    button.imageView.contentMode = UIViewContentModeScaleAspectFit;
     [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return button;
 }
 
-- (void)updateTitle:(NSString *)title artist:(NSString *)artist playing:(BOOL)playing {
+#pragma mark 内容
+
+- (void)updateTitle:(NSString *)title
+             artist:(NSString *)artist
+            playing:(BOOL)playing
+            elapsed:(double)elapsed
+           duration:(double)duration
+        artworkData:(NSData *)artworkData
+         canOpenApp:(BOOL)canOpenApp {
     _titleLabel.text = title.length ? title : @"正在播放";
     _subtitleLabel.text = artist.length ? artist : @"";
+
     if (@available(iOS 13.0, *)) {
-        [_toggleButton setImage:[UIImage systemImageNamed:playing ? @"pause.fill" : @"play.fill"]
-                       forState:UIControlStateNormal];
+        UIImageSymbolConfiguration *configuration =
+            [UIImageSymbolConfiguration configurationWithPointSize:26.0 weight:UIFontWeightBold];
+        UIImage *image = [UIImage systemImageNamed:(playing ? @"pause.fill" : @"play.fill")
+                                 withConfiguration:configuration];
+        [_toggleButton setImage:image forState:UIControlStateNormal];
+    }
+
+    _openButton.hidden = !canOpenApp;
+    if (artworkData) [self applyArtworkData:artworkData];
+
+    // 暂停/换曲/拖动进度：直接对齐；正常播放：只在漂移过大时对齐，避免每秒往回跳。
+    BOOL hardSync = playing != _playing || fabs(duration - _duration) > 0.5;
+    if (hardSync) {
+        _anchorElapsed = elapsed;
+        _anchorTime = CACurrentMediaTime();
+    } else {
+        double displayed = [self displayedElapsed];
+        if (fabs(elapsed - displayed) > 0.75) {
+            _anchorElapsed = elapsed;
+            _anchorTime = CACurrentMediaTime();
+        }
+    }
+    _playing = playing;
+    _duration = duration;
+
+    [self refreshProgress];
+    [self setNeedsLayout];
+}
+
+- (void)applyArtworkData:(NSData *)data {
+    // 字典是浅拷贝，同一个 NSData 实例会一直被复用，指针比较就够了，不必每次解码。
+    if (data == _lastArtworkData) return;
+    _lastArtworkData = data;
+
+    UIImage *image = data.length ? [UIImage imageWithData:data] : nil;
+    if (image) {
+        _artworkView.image = image;
+        _artworkView.contentMode = UIViewContentModeScaleAspectFill;
+        _artworkView.tintColor = nil;
+    } else if (@available(iOS 13.0, *)) {
+        _artworkView.image = [UIImage systemImageNamed:@"music.note"];
+        _artworkView.contentMode = UIViewContentModeCenter;
+        _artworkView.tintColor = [UIColor colorWithWhite:1.0 alpha:0.55];
     }
 }
+
+- (double)displayedElapsed {
+    if (!_playing) return MAX(0.0, _anchorElapsed);
+    double value = _anchorElapsed + (CACurrentMediaTime() - _anchorTime);
+    if (_duration > 0.0) value = MIN(value, _duration);
+    return MAX(0.0, value);
+}
+
+- (NSString *)timeStringForSeconds:(double)seconds {
+    if (!isfinite(seconds) || seconds < 0.0) seconds = 0.0;
+    NSInteger total = (NSInteger)seconds;
+    return [NSString stringWithFormat:@"%ld:%02ld", (long)(total / 60), (long)(total % 60)];
+}
+
+- (void)refreshProgress {
+    double elapsed = [self displayedElapsed];
+    BOOL hasDuration = _duration > 0.5;
+
+    _elapsedLabel.hidden = !hasDuration;
+    _remainingLabel.hidden = !hasDuration;
+    _progressTrack.hidden = !hasDuration;
+    if (!hasDuration) {
+        _elapsedLabel.text = nil;
+        _remainingLabel.text = nil;
+        return;
+    }
+
+    _elapsedLabel.text = [self timeStringForSeconds:elapsed];
+    _remainingLabel.text = [NSString stringWithFormat:@"-%@",
+                            [self timeStringForSeconds:MAX(0.0, _duration - elapsed)]];
+    [self layoutProgressFill];
+}
+
+- (void)layoutProgressFill {
+    CGFloat trackWidth = CGRectGetWidth(_progressTrack.bounds);
+    CGFloat trackHeight = CGRectGetHeight(_progressTrack.bounds);
+    if (trackWidth <= 0.0 || trackHeight <= 0.0) return;
+
+    double ratio = 0.0;
+    if (_duration > 0.0) {
+        ratio = MIN(1.0, MAX(0.0, [self displayedElapsed] / _duration));
+    }
+    CGFloat fillWidth = trackWidth * (CGFloat)ratio;
+    _progressFill.frame = CGRectMake(0.0, 0.0, fillWidth, trackHeight);
+    _progressFill.layer.cornerRadius = trackHeight / 2.0;
+    _progressGradient.frame = _progressFill.bounds;
+    _progressFill.hidden = fillWidth < 1.0;
+}
+
+#pragma mark 计时
+
+- (void)setHidden:(BOOL)hidden {
+    [super setHidden:hidden];
+    if (hidden) {
+        [_tickTimer invalidate];
+        _tickTimer = nil;
+    } else {
+        [self startTickingIfNeeded];
+    }
+}
+
+- (void)startTickingIfNeeded {
+    if (_tickTimer || self.hidden) return;
+    __weak typeof(self) weakSelf = self;
+    NSTimer *timer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *fireTimer) {
+        [weakSelf refreshProgress];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    _tickTimer = timer;
+}
+
+#pragma mark 交互
 
 - (void)tappedPrevious {
     if (self.onPrevious) self.onPrevious();
@@ -414,21 +629,62 @@ static BOOL PGStartFBSObserver(void) {
     if (self.onNext) self.onNext();
 }
 
+- (void)tappedOpen {
+    if (self.onOpenApplication) self.onOpenApplication();
+}
+
+#pragma mark 布局
+
 - (void)layoutSubviews {
     [super layoutSubviews];
-    CGFloat width = CGRectGetWidth(self.bounds);
-    _titleLabel.frame = CGRectMake(14.0, 10.0, width - 28.0, 18.0);
-    _subtitleLabel.frame = CGRectMake(14.0, 29.0, width - 28.0, 14.0);
 
-    CGFloat size = 46.0;
-    CGFloat gap = 24.0;
-    CGFloat total = size * 3.0 + gap * 2.0;
+    CGFloat width = CGRectGetWidth(self.bounds);
+    CGFloat height = CGRectGetHeight(self.bounds);
+    _blurView.frame = self.bounds;
+
+    CGFloat artSize = PGPanelArtworkSize;
+    _artworkView.frame = CGRectMake(PGPanelPadding, PGPanelPadding, artSize, artSize);
+    _artworkView.layer.cornerRadius = artSize / 2.0;
+
+    CGFloat textX = PGPanelPadding + artSize + 14.0;
+    CGFloat textWidth = MAX(0.0, width - textX - PGPanelPadding);
+    _titleLabel.frame = CGRectMake(textX, PGPanelPadding + 2.0, textWidth, 22.0);
+    _subtitleLabel.frame = CGRectMake(textX, PGPanelPadding + 26.0, textWidth, 18.0);
+
+    // 进度行：左边当前时间、右边剩余时间，中间是进度条。
+    CGFloat progressY = PGPanelPadding + artSize + 14.0;
+    CGFloat timeWidth = 42.0;
+    CGFloat trackX = PGPanelPadding + timeWidth + 10.0;
+    CGFloat trackRight = width - PGPanelPadding - timeWidth - 10.0;
+    CGFloat trackWidth = MAX(0.0, trackRight - trackX);
+    CGFloat trackHeight = 5.0;
+    CGFloat trackY = progressY + (16.0 - trackHeight) / 2.0;
+
+    _elapsedLabel.frame = CGRectMake(PGPanelPadding, progressY, timeWidth, 16.0);
+    _remainingLabel.frame = CGRectMake(width - PGPanelPadding - timeWidth, progressY, timeWidth, 16.0);
+    _progressTrack.frame = CGRectMake(trackX, trackY, trackWidth, trackHeight);
+    _progressTrack.layer.cornerRadius = trackHeight / 2.0;
+    [self layoutProgressFill];
+
+    // 按钮行：上一首 / 播放暂停 / 下一首 居中，右侧留一个"打开播放器"。
+    CGFloat toggleSize = 52.0;
+    CGFloat sideSize = 40.0;
+    CGFloat gap = 26.0;
+    CGFloat centerY = height - PGPanelPadding - toggleSize / 2.0;
+
+    CGFloat total = sideSize * 2.0 + toggleSize + gap * 2.0;
     CGFloat originX = (width - total) / 2.0;
-    CGFloat originY = CGRectGetHeight(self.bounds) - size - 10.0;
-    _previousButton.frame = CGRectMake(originX, originY, size, size);
-    _toggleButton.frame = CGRectMake(originX + size + gap, originY, size, size);
-    _nextButton.frame = CGRectMake(originX + (size + gap) * 2.0, originY, size, size);
-    _toggleButton.layer.cornerRadius = size / 2.0;
+    _previousButton.frame = CGRectMake(originX, centerY - sideSize / 2.0, sideSize, sideSize);
+    _toggleButton.frame = CGRectMake(originX + sideSize + gap, centerY - toggleSize / 2.0,
+                                     toggleSize, toggleSize);
+    _nextButton.frame = CGRectMake(originX + sideSize + gap + toggleSize + gap,
+                                   centerY - sideSize / 2.0, sideSize, sideSize);
+    _toggleButton.layer.cornerRadius = toggleSize / 2.0;
+    _toggleButton.layer.cornerCurve = kCACornerCurveContinuous;
+
+    CGFloat openSize = 34.0;
+    _openButton.frame = CGRectMake(width - PGPanelPadding - openSize,
+                                   centerY - openSize / 2.0, openSize, openSize);
 }
 
 @end
@@ -701,10 +957,22 @@ static UIWindowScene *PGLandscapeHostScene(void) {
                        artist:item.artist
                       playing:item.isPlaying];
     if (visible) {
-        [self.panel updateTitle:item.title artist:item.artist playing:item.isPlaying];
+        [self syncPanelWithNowPlaying:item];
     } else if (self.panelVisible) {
         [self hidePanel];
     }
+}
+
+/// 面板要的字段比胶囊多（进度、封面、能不能跳回播放器），统一在这里灌进去。
+- (void)syncPanelWithNowPlaying:(PGNowPlaying *)item {
+    if (!self.panel) return;
+    [self.panel updateTitle:item.title
+                     artist:item.artist
+                    playing:item.isPlaying
+                    elapsed:item.elapsed
+                   duration:item.duration
+                artworkData:item.artworkData
+                 canOpenApp:item.bundleIdentifier.length > 0];
 }
 
 - (void)handleBarTap:(UITapGestureRecognizer *)recognizer {
@@ -731,7 +999,7 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     if (self.window.bounds.size.width <= self.window.bounds.size.height) return;   // 仅横屏空间可用
 
     PGNowPlaying *nowPlaying = PGNowPlaying.sharedInstance;
-    [self.panel updateTitle:nowPlaying.title artist:nowPlaying.artist playing:nowPlaying.isPlaying];
+    [self syncPanelWithNowPlaying:nowPlaying];
 
     self.panelVisible = YES;
     self.panel.hidden = NO;
@@ -777,6 +1045,25 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
     if (preferences.vibrationFeedback) AudioServicesPlaySystemSound(1519);
     [self schedulePanelHide];
+}
+
+/// 面板右下角那个按钮：直接跳到正在放歌的 App。
+- (void)openNowPlayingApplication {
+    NSString *bundleIdentifier = PGNowPlaying.sharedInstance.bundleIdentifier;
+    if (bundleIdentifier.length == 0) return;
+
+    Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
+    if (!workspaceClass) return;
+    @try {
+        id workspace = ((id (*)(id, SEL))objc_msgSend)(workspaceClass, @selector(defaultWorkspace));
+        SEL selector = @selector(openApplicationWithBundleID:);
+        if (!workspace || ![workspace respondsToSelector:selector]) return;
+        ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, selector, bundleIdentifier);
+        PGLog(@"面板: 跳转到 %@", bundleIdentifier);
+    } @catch (__unused NSException *exception) {
+        PGLog(@"面板: 跳转 %@ 抛异常", bundleIdentifier);
+    }
+    [self hidePanel];
 }
 
 - (void)setSuspended:(BOOL)suspended {
@@ -1200,6 +1487,7 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     panel.onPrevious = ^{ [weakSelf sendMediaCommand:PGMediaCommandPrevious]; };
     panel.onToggle = ^{ [weakSelf sendMediaCommand:PGMediaCommandTogglePlayPause]; };
     panel.onNext = ^{ [weakSelf sendMediaCommand:PGMediaCommandNext]; };
+    panel.onOpenApplication = ^{ [weakSelf openNowPlayingApplication]; };
     [host addSubview:panel];
 
     window.barHitArea = bar;
@@ -1307,8 +1595,8 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         return;
     }
 
-    CGFloat panelWidth = MIN(272.0, MAX(160.0, spaceWidth - 60.0));
-    CGFloat panelHeight = 104.0;
+    CGFloat panelWidth = MIN(460.0, MAX(300.0, spaceWidth - 80.0));
+    CGFloat panelHeight = PGPanelHeight;
     self.panel.transform = CGAffineTransformIdentity;
     self.panel.bounds = CGRectMake(0.0, 0.0, panelWidth, panelHeight);
 

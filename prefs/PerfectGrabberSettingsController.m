@@ -166,15 +166,16 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"上滑背景颜色" action:@selector(chooseSwipeUpBackgroundColor)]];
 
     PSSpecifier *landscape = [PSSpecifier groupSpecifierWithName:@"横屏块"];
-    [landscape setProperty:@"横屏块固定单排显示（时间 + 电量在同一行），贴在屏幕最上方居中；竖屏自动隐藏。"
+    [landscape setProperty:@"横屏块固定单排显示（CPU 频率 + 电池温度 + 时间 + 电量在同一行），贴在屏幕最上方居中；竖屏自动隐藏。"
                     forKey:PSFooterTextGroupKey];
     [items addObject:landscape];
     [items addObject:[self preferenceNamed:@"显示正在播放的音乐" key:@"LandscapeMusic" defaultValue:@YES cell:PSSwitchCell]];
+    [items addObject:[self preferenceNamed:@"时间前显示 CPU 频率与电池温度" key:@"LandscapeMetrics" defaultValue:@YES cell:PSSwitchCell]];
     [items addObject:[self preferenceNamed:@"横屏块自定义背景色" key:@"LandscapeCustomBackground" defaultValue:@NO cell:PSSwitchCell]];
     [items addObject:[self buttonNamed:@"横屏块背景颜色" action:@selector(chooseLandscapeBackgroundColor)]];
 
     PSSpecifier *musicFooter = [PSSpecifier groupSpecifierWithName:@"播放控制"];
-    [musicFooter setProperty:@"边玩游戏边听歌时，横屏块会接上「♪ 歌名 · 歌手」。点一下横屏块弹出控制面板：上一首 / 播放暂停 / 下一首，6 秒无操作自动收起；再点一下也能收起。"
+    [musicFooter setProperty:@"边玩游戏边听歌时，横屏块会接上「♪ 歌名 · 歌手」。点一下横屏块弹出毛玻璃播放面板：封面、歌名、进度条，上一首 / 播放暂停 / 下一首，右下角可直接跳到正在播放的 App；6 秒无操作自动收起，再点一下也能收起。"
                        forKey:PSFooterTextGroupKey];
     [items addObject:musicFooter];
 
@@ -183,7 +184,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-21" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-22" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;
@@ -278,7 +279,7 @@ static void PGWriteValue(NSString *key, id value) {
 
 - (void)onResetSettings {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
-                      @"LandscapeMusic", @"LandscapeCustomBackground", @"LandscapeBackgroundColor",
+                      @"LandscapeMusic", @"LandscapeMetrics", @"LandscapeCustomBackground", @"LandscapeBackgroundColor",
                       @"Disable24H", @"ChargingIcon",
                       @"TwoLine", @"TextColor", @"GrabberStyle", @"FontSize", @"FontStyle",
                       @"EnabledBackgroundColor", @"BackgroundColor",

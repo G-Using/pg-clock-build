@@ -1,5 +1,6 @@
 #import "PGGrabberOverlayView.h"
 #import "PerfectGrabberPreferences.h"
+#import "PGHardwareMetrics.h"
 #import <math.h>
 
 @interface SBUIController : NSObject
@@ -18,6 +19,9 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
 @interface PGGrabberOverlayView ()
 @property (nonatomic, strong) UILabel *timeLabel;
 @property (nonatomic, strong) UILabel *batteryLabel;
+/// 单排最左边的"CPU 频率 + 电池温度"，和中间的时间之间也夹一条分隔线。
+@property (nonatomic, strong) UILabel *metricsLabel;
+@property (nonatomic, strong) UIView *metricsDivider;
 @property (nonatomic, strong) UILabel *musicLabel;
 @property (nonatomic, strong) UIImageView *musicStateView;
 @property (nonatomic, strong) UIView *divider;
@@ -52,6 +56,19 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
             label.numberOfLines = 1;
             [self addSubview:label];
         }
+
+        // 左边那截硬件指标：CPU 频率 + 电池温度。
+        _metricsLabel = [UILabel new];
+        _metricsLabel.numberOfLines = 1;
+        _metricsLabel.textAlignment = NSTextAlignmentLeft;
+        _metricsLabel.adjustsFontSizeToFitWidth = YES;
+        _metricsLabel.minimumScaleFactor = 0.7;
+        _metricsLabel.hidden = YES;
+        [self addSubview:_metricsLabel];
+
+        _metricsDivider = [UIView new];
+        _metricsDivider.hidden = YES;
+        [self addSubview:_metricsDivider];
 
         // 音乐区：分隔线 + 歌名 + 播放/暂停小图标，默认全部隐藏。
         _divider = [UIView new];
@@ -146,9 +163,37 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
         self.batteryLabel.text = nil;
         self.batteryLabel.hidden = YES;
     }
+    [self updateMetricsText];
     [self applyAppearance];
     [self setNeedsLayout];
     [self reportWidthIfNeeded];
+}
+
+/// 单排最左边那段：`3.46GHz 38.1°C`。读不到的项直接不写，两项都读不到就整段隐藏。
+- (void)updateMetricsText {
+    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
+    if (!self.forceSingleLine || !preferences.landscapeMetrics) {
+        self.metricsLabel.text = nil;
+        self.metricsLabel.hidden = YES;
+        return;
+    }
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    double gigahertz = PGCPUCurrentFrequencyGHz();
+    if (gigahertz > 0.0) {
+        if (gigahertz >= 1.0) {
+            [parts addObject:[NSString stringWithFormat:@"%.2fGHz", gigahertz]];
+        } else {
+            [parts addObject:[NSString stringWithFormat:@"%.0fMHz", gigahertz * 1000.0]];
+        }
+    }
+    double celsius = PGBatteryTemperatureCelsius();
+    if (!isnan(celsius)) {
+        [parts addObject:[NSString stringWithFormat:@"%.1f\u00B0C", celsius]];
+    }
+
+    self.metricsLabel.text = parts.count ? [parts componentsJoinedByString:@" "] : nil;
+    self.metricsLabel.hidden = parts.count == 0;
 }
 
 - (void)applyAppearance {
@@ -163,10 +208,13 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
     }
     self.musicLabel.font = font;
     self.musicLabel.textColor = [textColor colorWithAlphaComponent:0.95];
+    self.metricsLabel.font = font;
+    self.metricsLabel.textColor = [textColor colorWithAlphaComponent:0.92];
     if (@available(iOS 13.0, *)) {
         self.musicStateView.tintColor = textColor;
     }
     self.divider.backgroundColor = [textColor colorWithAlphaComponent:0.30];
+    self.metricsDivider.backgroundColor = [textColor colorWithAlphaComponent:0.30];
 
     UIColor *background = self.backgroundOverrideColor;
     if (!background) {
@@ -253,6 +301,11 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
 - (CGFloat)intrinsicWidth {
     if (self.forceSingleLine) {
         CGFloat width = 2.0 * PGSingleLinePadding;
+        if (self.metricsLabel.text.length > 0 && !self.metricsLabel.hidden) {
+            // 指标文字 + 分隔线两侧间距
+            CGSize metricsSize = [self.metricsLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX)];
+            width += ceil(metricsSize.width) + PGSingleLineSectionGap + 1.0 + PGSingleLineSectionGap;
+        }
         CGSize timeSize = [self.timeLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX)];
         width += ceil(timeSize.width);
         if (self.musicVisible) {
@@ -286,6 +339,8 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
     self.musicLabel.hidden = YES;
     self.musicStateView.hidden = YES;
     self.divider.hidden = YES;
+    self.metricsLabel.hidden = YES;
+    self.metricsDivider.hidden = YES;
 
     if (preferences.twoLine) {
         CGFloat rowHeight = CGRectGetHeight(contentBounds) / 2.0;
@@ -305,19 +360,39 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
     }
 }
 
-/// 单排：`15:04 45%  │  ♪ 歌名 · 歌手  ⏸`
+/// 单排：`3.46GHz 38.1°C │ 15:04 45% │ ♪ 歌名 · 歌手  ⏸`
 - (void)layoutSingleLine {
     CGFloat height = CGRectGetHeight(self.bounds);
     CGFloat width = CGRectGetWidth(self.bounds);
     CGFloat pad = PGSingleLinePadding;
-    CGRect inner = CGRectMake(pad, 0.0, MAX(0.0, width - 2.0 * pad), height);
+    CGFloat scale = MAX(UIScreen.mainScreen.scale, 1.0);
+    CGFloat lineHeight = MIN(14.0, height - 6.0);
+    CGFloat contentRight = width - pad;
 
     self.batteryLabel.frame = CGRectZero;
     self.batteryLabel.hidden = YES;
 
+    // 第一段：CPU 频率 + 电池温度（没内容就整段让位给时间）。
+    CGFloat cursor = pad;
+    if (self.metricsLabel.text.length > 0 && !self.metricsLabel.hidden) {
+        self.metricsLabel.hidden = NO;
+        CGSize metricsSize = [self.metricsLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, height)];
+        CGFloat metricsWidth = MIN(ceil(metricsSize.width), MAX(0.0, contentRight - pad));
+        self.metricsLabel.frame = CGRectMake(cursor, 0.0, metricsWidth, height);
+        cursor += metricsWidth + PGSingleLineSectionGap;
+        self.metricsDivider.hidden = NO;
+        self.metricsDivider.frame = CGRectMake(cursor, (height - lineHeight) / 2.0, 1.0 / scale, lineHeight);
+        cursor += 1.0 + PGSingleLineSectionGap;
+    } else {
+        self.metricsLabel.frame = CGRectZero;
+        self.metricsDivider.hidden = YES;
+        self.metricsDivider.frame = CGRectZero;
+    }
+
     if (!self.musicVisible) {
-        self.timeLabel.frame = inner;
+        // 没有音乐时，时间在剩下的空间里居中（有指标时是"指标右边的剩余空间"）。
         self.timeLabel.textAlignment = NSTextAlignmentCenter;
+        self.timeLabel.frame = CGRectMake(cursor, 0.0, MAX(0.0, contentRight - cursor), height);
         self.musicLabel.frame = CGRectZero;
         self.musicStateView.frame = CGRectZero;
         self.divider.frame = CGRectZero;
@@ -325,18 +400,16 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
     }
 
     CGSize timeSize = [self.timeLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, height)];
-    CGFloat timeWidth = MIN(ceil(timeSize.width), CGRectGetWidth(inner));
+    CGFloat timeWidth = MIN(ceil(timeSize.width), MAX(0.0, contentRight - cursor));
     self.timeLabel.textAlignment = NSTextAlignmentLeft;
-    self.timeLabel.frame = CGRectMake(pad, 0.0, timeWidth, height);
+    self.timeLabel.frame = CGRectMake(cursor, 0.0, timeWidth, height);
 
-    CGFloat cursor = pad + timeWidth + PGSingleLineSectionGap;
-    CGFloat lineHeight = MIN(14.0, height - 6.0);
-    self.divider.frame = CGRectMake(cursor, (height - lineHeight) / 2.0,
-                                   1.0 / MAX(UIScreen.mainScreen.scale, 1.0), lineHeight);
+    cursor += timeWidth + PGSingleLineSectionGap;
+    self.divider.frame = CGRectMake(cursor, (height - lineHeight) / 2.0, 1.0 / scale, lineHeight);
 
     cursor += 1.0 + PGSingleLineSectionGap;
     CGFloat glyphWidth = 12.0;
-    CGFloat glyphX = width - pad - glyphWidth;
+    CGFloat glyphX = contentRight - glyphWidth;
     CGFloat musicWidth = MAX(0.0, glyphX - 8.0 - cursor);
     self.musicLabel.frame = CGRectMake(cursor, 0.0, musicWidth, height);
 

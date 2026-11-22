@@ -102,6 +102,9 @@ static NSString *PGBundleIdentifierForPID(int pid) {
 @property (nonatomic, copy, nullable) NSString *artist;
 @property (nonatomic, copy, nullable) NSString *bundleIdentifier;
 @property (nonatomic, copy, nullable) NSString *frontmostBundleIdentifier;
+@property (nonatomic, assign) double elapsed;
+@property (nonatomic, assign) double duration;
+@property (nonatomic, copy, nullable) NSData *artworkData;
 @property (nonatomic, copy) NSString *signature;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
 @property (nonatomic, strong, nullable) dispatch_queue_t queue;
@@ -281,6 +284,9 @@ static NSString *PGBundleIdentifierForPID(int pid) {
         self.ratePositive = NO;
         self.elapsedAdvancing = NO;
         self.hasElapsedSample = NO;
+        self.elapsed = 0.0;
+        self.duration = 0.0;
+        self.artworkData = nil;
         [self recomputePlaying];
         return;
     }
@@ -323,10 +329,20 @@ static NSString *PGBundleIdentifierForPID(int pid) {
             self.hasElapsedSample = YES;
         }
         self.lastElapsed = value;
+        self.elapsed = value;
     } else {
         self.elapsedAdvancing = NO;
         self.hasElapsedSample = NO;
+        self.elapsed = 0.0;
     }
+
+    // 进度条要用的总时长与封面。这两个不进签名（否则每秒都在回调），
+    // 面板自己按拍从 sharedInstance 读。
+    id duration = dictionary[@"kMRMediaRemoteNowPlayingInfoDuration"];
+    self.duration = [duration respondsToSelector:@selector(doubleValue)] ? [duration doubleValue] : 0.0;
+
+    id artwork = dictionary[@"kMRMediaRemoteNowPlayingInfoArtworkData"];
+    self.artworkData = [artwork isKindOfClass:NSData.class] ? artwork : nil;
 
     [self recomputePlaying];
 }
