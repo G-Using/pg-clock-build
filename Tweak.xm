@@ -222,26 +222,82 @@ static void PGPreferencesChanged(CFNotificationCenterRef center, void *observer,
     });
 }
 
-%ctor {
-    @autoreleasepool {
-        if (![[NSProcessInfo processInfo].processName isEqualToString:@"SpringBoard"]) return;
+#pragma mark - 启动时机与崩溃守卫
+
+extern void PGDebugLog(NSString *format, ...);
+
+/// 启动标记文件。存在 = 上一次 SpringBoard 在启动流程走完之前就死了，
+/// 那基本就是本插件的启动路径把它带下来的（就是安全模式）。
+static NSString *const PGStartupGuardPath = @"/var/mobile/Media/PerfectGrabber.startup";
+
+/// 领一次启动机会。返回 NO 表示上次崩过，本次先不启动横屏块，让 SpringBoard 能起来。
+static BOOL PGStartupGuardClaim(void) {
+    NSFileManager *manager = [NSFileManager defaultManager];
+    if ([manager fileExistsAtPath:PGStartupGuardPath]) {
+        [manager removeItemAtPath:PGStartupGuardPath error:NULL];
+        return NO;
+    }
+    [@"started" writeToFile:PGStartupGuardPath atomically:YES
+                  encoding:NSUTF8StringEncoding error:NULL];
+    return YES;
+}
+
+static void PGStartupGuardClear(void) {
+    [[NSFileManager defaultManager] removeItemAtPath:PGStartupGuardPath error:NULL];
+}
+
+static BOOL PGStartupScheduled = NO;
+static BOOL PGStartupAllowed = NO;
+
+/// dyld 阶段（%ctor）里绝对不能碰 SpringBoard 的私有服务。
+/// 那时 SBApplicationController / 媒体远控 / 场景管理器都还没初始化，
+/// 它们的"查询"函数会把未初始化的全局变量当指针返回 —— 一旦把这个垃圾指针
+/// 当 ObjC 对象交给 ARC 去 retain，就是 EXC_BAD_ACCESS（0x10000003 / objc_retain）
+/// 加安全模式。所以 %ctor 只登记钩子，真正的工作推迟到 SpringBoard 的 runloop 跑起来之后。
+static void PGScheduleStartupWork(void) {
+    if (PGStartupScheduled) return;
+    PGStartupScheduled = YES;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!PGStartupAllowed) {
+            PGDebugLog(@"启动守卫: 上次启动中途崩溃，本次跳过横屏块（下次启动会自动重试）");
+            return;
+        }
+
         [PerfectGrabberPreferences.sharedPreferences reload];
-        // 横屏常驻块与下拉/上滑无关，加载时就要按当前方向判定一次。
         [PGLandscapeBar.sharedBar reloadPreferences];
-        // dyld 早期 FrontBoardServices / CFPreferences 可能都还没备好，等 SpringBoard 起来后再确认一次。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [PerfectGrabberPreferences.sharedPreferences reload];
-            [PGLandscapeBar.sharedBar reloadPreferences];
-        });
+
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         PGPreferencesChanged,
                                         (__bridge CFStringRef)PGPreferencesChangedNotification,
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+        // 再补一拍：SpringBoard 起来之后场景和前台 App 才第一次有值。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [PGLandscapeBar.sharedBar reloadPreferences];
+        });
+
+        // 平安活过这段就认为启动路径没问题，把标记撤掉。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            PGStartupGuardClear();
+        });
+    });
+}
+
+%ctor {
+    @autoreleasepool {
+        if (![[NSProcessInfo processInfo].processName isEqualToString:@"SpringBoard"]) return;
+        // 只有这一步是安全的：只是查类与选择子存不存在，不碰任何 SpringBoard 状态。
         Class grabberClass = NSClassFromString(@"SBGrabberTongue");
         if (grabberClass && class_getInstanceMethod(grabberClass, @selector(_willPresent)) &&
             class_getInstanceMethod(grabberClass, @selector(_willDismiss))) {
             %init(PerfectGrabberHooks, SBGrabberTongue = grabberClass);
         }
+        // 先领标记再干活：本次启动若崩在下面任何一步，下次启动会看到标记并跳过横屏块。
+        PGStartupAllowed = PGStartupGuardClaim();
+        PGScheduleStartupWork();
     }
 }

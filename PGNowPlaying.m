@@ -52,25 +52,60 @@ static NSString *PGStringFromObject(id object, NSString *selectorName) {
     }
 }
 
+/// dlsym 出来的函数没法校验签名，返回值只能自己验。
+/// 这里曾经出过事故：把返回值直接当 NSString* 交给 ARC，ARC 立刻 objc_retain，
+/// 而那个值是 0x10000003（根本不是地址）—— SpringBoard 直接 EXC_BAD_ACCESS 进安全模式。
+/// iOS 用户态对象指针不可能低于 4GB，也至少 8 字节对齐，两条一起卡掉绝大部分垃圾值。
+static BOOL PGLooksLikeObjectPointer(const void *pointer) {
+    uintptr_t value = (uintptr_t)pointer;
+    if (value < 0x100000000ULL) return NO;
+    if (value & 0x7ULL) return NO;
+    if (value >= 0x0000FFFFFFFFFFFFULL) return NO;
+    return YES;
+}
+
 /// SpringBoard 自己的"当前前台 App"接口。比 LSApplicationWorkspace.frontmostApplication 可靠：
 /// 从桌面再进入 App 的那一下，后者会短暂返回 nil 或上一个 App，用它判断"是否后台播放"
 /// 就会一会儿"是"一会儿"不是"，胶囊上的歌名跟着忽有忽无。
+static NSInteger PGSBFrontmostFailures = 0;
+
 static NSString *PGSBFrontmostBundleIdentifier(void) {
-    static NSString *(*query)(void) = NULL;
+    // 故意声明成返回 void*：让编译器/ARC 不要在这个调用点上插 retain。
+    // 校验通过之后才用 __bridge 转成对象。
+    static void *(*query)(void) = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         void *handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
                               RTLD_LAZY);
-        if (handle) query = (NSString *(*)(void))dlsym(handle, "SBFrontmostApplicationDisplayIdentifier");
+        if (handle) query = (void *(*)(void))dlsym(handle, "SBFrontmostApplicationDisplayIdentifier");
         if (!handle || !query) PGDebugLog(@"SpringBoardServices: 前台接口不可用(%d/%d)", handle != NULL, query != NULL);
     });
     if (!query) return nil;
+
+    void *raw = NULL;
     @try {
-        NSString *value = query();
-        if ([value isKindOfClass:NSString.class] && value.length > 0) return value;
+        raw = query();
     } @catch (__unused NSException *exception) {
+        return nil;
     }
-    return nil;
+    if (!PGLooksLikeObjectPointer(raw)) {
+        PGDebugLog(@"SpringBoardServices: 前台接口返回非法指针(%p)，忽略", raw);
+        // 连着三次都不对，说明这个接口在当前系统上根本不可用，别再反复踩。
+        if (++PGSBFrontmostFailures >= 3) {
+            query = NULL;
+            PGDebugLog(@"SpringBoardServices: 连续 3 次非法返回，永久停用该接口");
+        }
+        return nil;
+    }
+
+    __unsafe_unretained NSString *value = (__bridge __unsafe_unretained NSString *)raw;
+    @try {
+        if (![value isKindOfClass:NSString.class]) return nil;
+        if (value.length == 0) return nil;
+        return value;   // 到这一步才确认是字符串，ARC 这时 retain 是安全的
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
 }
 
 static NSString *PGFrontmostBundleIdentifier(void) {
