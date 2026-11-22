@@ -141,7 +141,7 @@ static void PGWriteValue(NSString *key, id value) {
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"触发方式"]];
     [items addObject:[self preferenceNamed:@"上滑时显示" key:@"ShowOnSwipeUp" defaultValue:@YES cell:PSSwitchCell]];
-    [items addObject:[self preferenceNamed:@"常驻显示（竖屏在灵动岛下方）" key:@"LandscapeAlwaysOn" defaultValue:@YES cell:PSSwitchCell]];
+    [items addObject:[self preferenceNamed:@"横屏时显示（竖屏自动隐藏）" key:@"LandscapeAlwaysOn" defaultValue:@YES cell:PSSwitchCell]];
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"显示"]];
     [items addObject:[self preferenceNamed:@"使用 12 小时制" key:@"Disable24H" defaultValue:@NO cell:PSSwitchCell]];
@@ -165,18 +165,12 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self preferenceNamed:@"启用上滑背景颜色" key:@"EnabledSwipeUpBackgroundColor" defaultValue:@NO cell:PSSwitchCell]];
     [items addObject:[self buttonNamed:@"上滑背景颜色" action:@selector(chooseSwipeUpBackgroundColor)]];
 
-    PSSpecifier *diagnostic = [PSSpecifier groupSpecifierWithName:@"排查"];
-    [diagnostic setProperty:@"「强制横屏显示」仅供排查：打开后不管手机怎么拿都按横屏排版，竖屏下会显示成一条竖着的窄条，这是正常的。排查完请务必关掉。诊断日志：/var/mobile/Media/PerfectGrabber.log"
-                   forKey:PSFooterTextGroupKey];
-    [items addObject:diagnostic];
-    [items addObject:[self preferenceNamed:@"强制横屏显示（排查用）" key:@"DebugForceLandscape" defaultValue:@NO cell:PSSwitchCell]];
-
     [items addObject:[PSSpecifier groupSpecifierWithName:@"操作"]];
     [items addObject:[self buttonNamed:@"恢复默认设置" action:@selector(onResetSettings)]];
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-12+roothide38" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-13+roothide39" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;
@@ -263,7 +257,7 @@ static void PGWriteValue(NSString *key, id value) {
 
 - (void)onResetSettings {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
-                      @"DebugForceLandscape", @"Disable24H", @"ChargingIcon",
+                      @"Disable24H", @"ChargingIcon",
                       @"TwoLine", @"TextColor", @"GrabberStyle", @"FontSize", @"FontStyle",
                       @"EnabledBackgroundColor", @"BackgroundColor",
                       @"EnabledSwipeUpBackgroundColor", @"SwipeUpBackgroundColor"];

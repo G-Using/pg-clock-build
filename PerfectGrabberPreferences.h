@@ -12,9 +12,6 @@ FOUNDATION_EXPORT NSString *const PGPreferencesChangedNotification;
 @property (nonatomic, readonly) BOOL vibrationFeedback;
 @property (nonatomic, readonly) BOOL showOnSwipeUp;
 @property (nonatomic, readonly) BOOL landscapeAlwaysOn;
-/// 诊断用：忽略方向判定，只要总开关和横屏常驻开关打开就强行横屏显示。
-/// 用来区分「方向判定失效」和「窗口/层级不显示」两类问题。
-@property (nonatomic, readonly) BOOL debugForceLandscape;
 @property (nonatomic, readonly) BOOL disable24Hour;
 @property (nonatomic, readonly) BOOL chargingIcon;
 @property (nonatomic, readonly) BOOL twoLine;
