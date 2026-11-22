@@ -364,6 +364,8 @@ static void PGPostDiagnosticAlert(NSString *title, NSString *message) {
 @property (nonatomic, assign) NSInteger pollTicks;
 @property (nonatomic, assign) BOOL laidOut;
 @property (nonatomic, assign) BOOL laidOutLeftEdgeUp;
+/// 上次排版是不是"贴顶边"（否则贴底边）。用于判断是否需要重排。
+@property (nonatomic, assign) BOOL laidOutAnchorAtTop;
 @property (nonatomic, assign) CGSize laidOutScreenSize;
 /// 最近一次解析结果，供日志/诊断弹窗使用。
 @property (nonatomic, copy) NSString *resolvedSource;
@@ -643,10 +645,7 @@ static void PGPostDiagnosticAlert(NSString *title, NSString *message) {
         return;
     }
 
-    // 位置纠错：万一把"哪一侧朝上"判反了，用户打开这个开关就能换到另一侧。
-    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
-    if (preferences.landscapeFlipSide) leftEdgeUp = !leftEdgeUp;
-
+    // 位置纠错在排版里处理（贴顶 / 贴底），这里只负责把方向事实传下去。
     [self showBarLeftEdgeUp:leftEdgeUp];
     [self logSnapshotShown:YES note:[@"show/" stringByAppendingString:source]];
 }
@@ -695,7 +694,7 @@ static void PGPostDiagnosticAlert(NSString *title, NSString *message) {
 - (BOOL)ensureWindowAndSubviews {
     if (self.window) return YES;
 
-    // 坐标系恒为竖屏基准（SpringBoard 自己的窗口不跟随 App 旋转）。
+    // 只用来做一次合法性检查；实际排版尺寸一律读 window.bounds（横竖屏由系统改写）。
     CGRect base = UIScreen.mainScreen.bounds;
     if (CGRectGetWidth(base) <= 0.0 || CGRectGetHeight(base) <= 0.0) return NO;
 
@@ -707,7 +706,9 @@ static void PGPostDiagnosticAlert(NSString *title, NSString *message) {
         window = [[PGLandscapeBarWindow alloc] initWithFrame:base];
     }
     if (!window) return NO;
-    window.frame = base;
+    // 不要手动设 frame：场景窗口的 frame 由系统维护，横竖屏切换时会被自动改成 932x430 / 430x932，
+    // 手动写成竖屏尺寸会把胶囊算到屏幕外。
+    if (!scene) window.frame = base;
     // 必须远高于普通 App 窗口：全屏视频时前台 App 的层级很高。
     // 系统自带 HUD 都是这个量级，照抄才不会"窗口建好了但看不见"。
     window.windowLevel = UIWindowLevelAlert + 1000000.0;
@@ -736,39 +737,63 @@ static void PGPostDiagnosticAlert(NSString *title, NSString *message) {
 }
 
 - (void)layoutBarLeftEdgeUp:(BOOL)leftEdgeUp {
-    CGRect screen = UIScreen.mainScreen.bounds;   // 恒竖屏基准：宽=水平，高=竖直
-    CGFloat screenWidth = CGRectGetWidth(screen);
-    CGFloat screenHeight = CGRectGetHeight(screen);
-    if (screenWidth <= 0.0 || screenHeight <= 0.0) return;
+    if (!self.window || !self.bar) return;
+
+    // 关键：坐标空间一律取窗口自己的 bounds，绝不能再拿 UIScreen.mainScreen.bounds 去改窗口 frame。
+    // 横屏时这个窗口的 bounds 会被系统改成 932x430（宽 > 高），此时用户视角的"最上方"就是 y=0 那条长边；
+    // 旧代码把竖屏的 430x932 当基准，算出来的中心点落在横屏空间的右侧边缘 —— 这就是"块跑到右边"的根因。
+    CGRect space = self.window.bounds;
+    CGFloat spaceWidth = CGRectGetWidth(space);
+    CGFloat spaceHeight = CGRectGetHeight(space);
+    if (spaceWidth <= 0.0 || spaceHeight <= 0.0) return;
+
+    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
+    BOOL anchorAtTop = !preferences.landscapeFlipSide;   // 默认贴顶边，开关打开则贴底边
+    BOOL landscapeSpace = spaceWidth > spaceHeight;      // 窗口已按横屏铺开
 
     BOOL sameGeometry = self.laidOut &&
                         self.laidOutLeftEdgeUp == leftEdgeUp &&
-                        fabs(self.laidOutScreenSize.width - screenWidth) < 0.5 &&
-                        fabs(self.laidOutScreenSize.height - screenHeight) < 0.5;
+                        self.laidOutAnchorAtTop == anchorAtTop &&
+                        fabs(self.laidOutScreenSize.width - spaceWidth) < 0.5 &&
+                        fabs(self.laidOutScreenSize.height - spaceHeight) < 0.5;
     if (sameGeometry) return;
 
-    // 横屏时胶囊沿"物理竖直方向"铺开，可用长度就是屏幕的高。
-    CGFloat available = screenHeight - 2.0 * PGLandscapeBarEdgeInset - 24.0;
+    // 胶囊的长轴可以沿着窗口的"长边"铺开，可用长度取空间的长边。
+    CGFloat inset = PGLandscapeBarEdgeInset;
+    CGFloat available = (landscapeSpace ? spaceWidth : spaceHeight) - 2.0 * inset - 24.0;
     CGSize size = [self.bar preferredContentSizeForMaxWidth:MAX(80.0, available)];
     CGFloat barLength = MIN(MAX(size.width, 44.0), MAX(available, 44.0));
     CGFloat barThickness = MAX(size.height, 20.0);
 
-    self.window.frame = screen;
-
-    // 直接旋转胶囊本身：绕自身中心转 90°，文字随之一起转，手机横过来读起来才是正的。
     self.bar.transform = CGAffineTransformIdentity;
     self.bar.bounds = CGRectMake(0.0, 0.0, barLength, barThickness);
-    CGFloat centerX = leftEdgeUp ? (PGLandscapeBarEdgeInset + barThickness / 2.0)
-                                 : (screenWidth - PGLandscapeBarEdgeInset - barThickness / 2.0);
-    self.bar.center = CGPointMake(centerX, screenHeight / 2.0);
-    self.bar.transform = CGAffineTransformMakeRotation(leftEdgeUp ? -M_PI_2 : M_PI_2);
+
+    CGPoint center = CGPointZero;
+    if (landscapeSpace) {
+        // 横屏空间：顶端居中，胶囊横着躺，文字方向天然是正的，不需要旋转。
+        CGFloat centerY = anchorAtTop ? (inset + barThickness / 2.0)
+                                      : (spaceHeight - inset - barThickness / 2.0);
+        center = CGPointMake(spaceWidth / 2.0, centerY);
+        self.bar.center = center;
+    } else {
+        // 兜底：窗口若仍停在竖屏基准（430x932），用户视角的顶边就是左右两条长边，
+        // 这时才需要把胶囊旋转 90° 贴边。
+        BOOL leftSide = anchorAtTop ? leftEdgeUp : !leftEdgeUp;
+        CGFloat centerX = leftSide ? (inset + barThickness / 2.0)
+                                   : (spaceWidth - inset - barThickness / 2.0);
+        center = CGPointMake(centerX, spaceHeight / 2.0);
+        self.bar.center = center;
+        self.bar.transform = CGAffineTransformMakeRotation(leftSide ? -M_PI_2 : M_PI_2);
+    }
 
     self.laidOut = YES;
     self.laidOutLeftEdgeUp = leftEdgeUp;
-    self.laidOutScreenSize = CGSizeMake(screenWidth, screenHeight);
+    self.laidOutAnchorAtTop = anchorAtTop;
+    self.laidOutScreenSize = CGSizeMake(spaceWidth, spaceHeight);
 
-    PGLog(@"排版: 左侧朝上=%d 屏=%.0fx%.0f 胶囊=%.0fx%.0f 中心=(%.0f,%.0f)",
-          leftEdgeUp, screenWidth, screenHeight, barLength, barThickness, centerX, screenHeight / 2.0);
+    PGLog(@"排版: 横屏空间=%d 贴顶=%d 左边缘朝上=%d 空间=%.0fx%.0f 胶囊=%.0fx%.0f 中心=(%.0f,%.0f)",
+          landscapeSpace, anchorAtTop, leftEdgeUp, spaceWidth, spaceHeight,
+          barLength, barThickness, center.x, center.y);
 }
 
 - (void)hideBar {

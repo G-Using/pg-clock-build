@@ -89,6 +89,8 @@ rewrite_id_strip_jb "$PREFS" "/Library/PreferenceBundles/PerfectGrabberSettings.
 # ---------- 3. control ----------
 ctl="$root/DEBIAN/control"
 perl -0pi -e 's/^Architecture:.*$/Architecture: iphoneos-arm64e/m' "$ctl"
+# 版本加 +roothide 后缀：两个包版本号不同，切换安装时 dpkg 才认得出是不同的包。
+perl -0pi -e 's/^Version:\s*(\S+).*$/Version: $1+roothide/m' "$ctl"
 echo "--- control ---"
 cat "$ctl"
 

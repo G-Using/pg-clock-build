@@ -66,6 +66,19 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
                                  (__bridge CFStringRef)PGPreferencesDomain);
         CFPreferencesAppSynchronize((__bridge CFStringRef)PGPreferencesDomain);
     }
+    // 1.1-15 起横屏块改成"贴顶边居中"，LandscapeFlipSide 的语义从"换到左右另一侧"变成"改贴底边"。
+    // 旧版本里用户为了纠错可能把它打开过，升级后会莫名跑到屏幕底部；同时顺手关掉排查弹窗。
+    NSString *placementKey = @"PGPlacementRevision";
+    if ([[self valueForKey:placementKey fallback:@0] integerValue] < 2) {
+        CFPreferencesSetAppValue(CFSTR("LandscapeFlipSide"), kCFBooleanFalse,
+                                 (__bridge CFStringRef)PGPreferencesDomain);
+        CFPreferencesSetAppValue(CFSTR("DebugAlertEnabled"), kCFBooleanFalse,
+                                 (__bridge CFStringRef)PGPreferencesDomain);
+        CFPreferencesSetAppValue((__bridge CFStringRef)placementKey,
+                                 (__bridge CFPropertyListRef)@2,
+                                 (__bridge CFStringRef)PGPreferencesDomain);
+        CFPreferencesAppSynchronize((__bridge CFStringRef)PGPreferencesDomain);
+    }
     self.enabled = [[self valueForKey:@"EnabledPerfectGrabber" fallback:@NO] boolValue];
     self.vibrationFeedback = [[self valueForKey:@"VibrationFeedback" fallback:@YES] boolValue];
     self.showOnSwipeUp = [[self valueForKey:@"ShowOnSwipeUp" fallback:@YES] boolValue];

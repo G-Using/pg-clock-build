@@ -142,7 +142,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[PSSpecifier groupSpecifierWithName:@"触发方式"]];
     [items addObject:[self preferenceNamed:@"上滑时显示" key:@"ShowOnSwipeUp" defaultValue:@YES cell:PSSwitchCell]];
     [items addObject:[self preferenceNamed:@"横屏时显示（竖屏自动隐藏）" key:@"LandscapeAlwaysOn" defaultValue:@YES cell:PSSwitchCell]];
-    [items addObject:[self preferenceNamed:@"横屏块显示在另一侧" key:@"LandscapeFlipSide" defaultValue:@NO cell:PSSwitchCell]];
+    [items addObject:[self preferenceNamed:@"横屏块贴到屏幕底部（默认贴顶部居中）" key:@"LandscapeFlipSide" defaultValue:@NO cell:PSSwitchCell]];
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"显示"]];
     [items addObject:[self preferenceNamed:@"使用 12 小时制" key:@"Disable24H" defaultValue:@NO cell:PSSwitchCell]];
@@ -177,7 +177,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-14+roothide40" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-15" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;
