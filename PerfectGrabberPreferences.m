@@ -10,6 +10,7 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
 @property (nonatomic, readwrite) BOOL landscapeAlwaysOn;
 @property (nonatomic, readwrite) BOOL landscapeMusic;
 @property (nonatomic, readwrite) BOOL landscapeMetrics;
+@property (nonatomic, readwrite) BOOL landscapeMetricsUsage;
 @property (nonatomic, readwrite) BOOL landscapeCustomBackground;
 @property (nonatomic, readwrite) UIColor *landscapeBackgroundColor;
 @property (nonatomic, readwrite) BOOL disable24Hour;
@@ -87,6 +88,7 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
     self.landscapeAlwaysOn = [[self valueForKey:@"LandscapeAlwaysOn" fallback:@YES] boolValue];
     self.landscapeMusic = [[self valueForKey:@"LandscapeMusic" fallback:@YES] boolValue];
     self.landscapeMetrics = [[self valueForKey:@"LandscapeMetrics" fallback:@YES] boolValue];
+    self.landscapeMetricsUsage = [[self valueForKey:@"LandscapeMetricsUsage" fallback:@YES] boolValue];
     self.landscapeCustomBackground = [[self valueForKey:@"LandscapeCustomBackground" fallback:@NO] boolValue];
     self.landscapeBackgroundColor =
         [PerfectGrabberPreferences colorFromHexString:[self valueForKey:@"LandscapeBackgroundColor" fallback:@"#00BFFF"]

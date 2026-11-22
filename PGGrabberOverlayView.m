@@ -169,7 +169,8 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
     [self reportWidthIfNeeded];
 }
 
-/// 单排最左边那段：`3.46GHz 38.1°C`。读不到的项直接不写，两项都读不到就整段隐藏。
+/// 单排最左边那段：`CPU 37% 38.1°C`（或选了频率模式时 `3.46GHz 38.1°C`）。
+/// 读不到的项直接不写，两项都读不到就整段隐藏。
 - (void)updateMetricsText {
     PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
     if (!self.forceSingleLine || !preferences.landscapeMetrics) {
@@ -179,12 +180,20 @@ static const CGFloat PGMusicMaxTextWidth = 280.0;
     }
 
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    double gigahertz = PGCPUCurrentFrequencyGHz();
-    if (gigahertz > 0.0) {
-        if (gigahertz >= 1.0) {
-            [parts addObject:[NSString stringWithFormat:@"%.2fGHz", gigahertz]];
-        } else {
-            [parts addObject:[NSString stringWithFormat:@"%.0fMHz", gigahertz * 1000.0]];
+    if (preferences.landscapeMetricsUsage) {
+        // 占比固定两位宽（7% 写成 " 7%"），占用率在个位/十位之间跳时胶囊宽度不会抖。
+        double usage = PGCPUUsagePercent();
+        if (!isnan(usage)) {
+            [parts addObject:[NSString stringWithFormat:@"CPU %2.0f%%", usage]];
+        }
+    } else {
+        double gigahertz = PGCPUCurrentFrequencyGHz();
+        if (gigahertz > 0.0) {
+            if (gigahertz >= 1.0) {
+                [parts addObject:[NSString stringWithFormat:@"%.2fGHz", gigahertz]];
+            } else {
+                [parts addObject:[NSString stringWithFormat:@"%.0fMHz", gigahertz * 1000.0]];
+            }
         }
     }
     double celsius = PGBatteryTemperatureCelsius();

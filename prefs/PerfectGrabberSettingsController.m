@@ -166,11 +166,12 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"上滑背景颜色" action:@selector(chooseSwipeUpBackgroundColor)]];
 
     PSSpecifier *landscape = [PSSpecifier groupSpecifierWithName:@"横屏块"];
-    [landscape setProperty:@"横屏块固定单排显示（CPU 频率 + 电池温度 + 时间 + 电量在同一行），贴在屏幕最上方居中；竖屏自动隐藏。"
+    [landscape setProperty:@"横屏块固定单排显示（CPU 指标 + 电池温度 + 时间 + 电量在同一行），贴在屏幕最上方居中；竖屏自动隐藏。CPU 默认显示实时占用率——iOS 不开放真正的瞬时主频，读到的\"最高频率\"在部分机型上并不可信（会把别的频率表读成 CPU 频率），想要看的话可以在下面切换。"
                     forKey:PSFooterTextGroupKey];
     [items addObject:landscape];
     [items addObject:[self preferenceNamed:@"显示正在播放的音乐" key:@"LandscapeMusic" defaultValue:@YES cell:PSSwitchCell]];
-    [items addObject:[self preferenceNamed:@"时间前显示 CPU 频率与电池温度" key:@"LandscapeMetrics" defaultValue:@YES cell:PSSwitchCell]];
+    [items addObject:[self preferenceNamed:@"时间前显示 CPU 与电池温度" key:@"LandscapeMetrics" defaultValue:@YES cell:PSSwitchCell]];
+    [items addObject:[self preferenceNamed:@"CPU 显示占用率（关＝芯片最高频率）" key:@"LandscapeMetricsUsage" defaultValue:@YES cell:PSSwitchCell]];
     [items addObject:[self preferenceNamed:@"横屏块自定义背景色" key:@"LandscapeCustomBackground" defaultValue:@NO cell:PSSwitchCell]];
     [items addObject:[self buttonNamed:@"横屏块背景颜色" action:@selector(chooseLandscapeBackgroundColor)]];
 
@@ -184,7 +185,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-22" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-23" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;
@@ -279,7 +280,7 @@ static void PGWriteValue(NSString *key, id value) {
 
 - (void)onResetSettings {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
-                      @"LandscapeMusic", @"LandscapeMetrics", @"LandscapeCustomBackground", @"LandscapeBackgroundColor",
+                      @"LandscapeMusic", @"LandscapeMetrics", @"LandscapeMetricsUsage", @"LandscapeCustomBackground", @"LandscapeBackgroundColor",
                       @"Disable24H", @"ChargingIcon",
                       @"TwoLine", @"TextColor", @"GrabberStyle", @"FontSize", @"FontStyle",
                       @"EnabledBackgroundColor", @"BackgroundColor",

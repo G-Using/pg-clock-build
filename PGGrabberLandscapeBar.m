@@ -352,6 +352,14 @@ static const CGFloat PGPanelHeight = 200.0;
 
 @implementation PGLandscapeControlPanel {
     UIVisualEffectView *_blurView;
+    /// 叠在毛玻璃之上的极淡暗渐变：只压住底部按钮区的对比度，不做整块压暗，
+    /// 否则面板又变回"半透明色块"，透不出背后的画面。
+    UIView *_tintView;
+    CAGradientLayer *_tintGradient;
+    /// 左上到右下的白色高光，模拟玻璃反光。
+    UIView *_sheenView;
+    CAGradientLayer *_sheenGradient;
+    BOOL _didBoostBlur;
     UIImageView *_artworkView;
     UILabel *_titleLabel;
     UILabel *_subtitleLabel;
@@ -384,18 +392,44 @@ static const CGFloat PGPanelHeight = 200.0;
         self.layer.cornerCurve = kCACornerCurveContinuous;
         self.clipsToBounds = YES;
         self.layer.borderWidth = 1.0 / MAX(UIScreen.mainScreen.scale, 1.0);
-        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.16].CGColor;
+        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.26].CGColor;
 
-        // 毛玻璃：薄材质深色，背后游戏的色彩会透上来但压暗，文字才看得清。
+        // 毛玻璃：ultraThin 是最透的一档 —— 背后游戏的色块会被糊开、颜色透上来，
+        // 而不是像 thinMaterial 那样把整块压成深灰。可读性靠上面的渐变 + 文字阴影补。
         UIBlurEffect *effect = nil;
         if (@available(iOS 13.0, *)) {
-            effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark];
+            effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
         } else {
             effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
         }
         _blurView = [[UIVisualEffectView alloc] initWithEffect:effect];
         _blurView.userInteractionEnabled = NO;
         [self addSubview:_blurView];
+
+        // 只压底部（按钮/进度条所在的那半），顶部保持通透。
+        _tintView = [UIView new];
+        _tintView.userInteractionEnabled = NO;
+        _tintGradient = [CAGradientLayer layer];
+        _tintGradient.colors = @[(__bridge id)[UIColor colorWithWhite:0.0 alpha:0.02].CGColor,
+                                 (__bridge id)[UIColor colorWithWhite:0.0 alpha:0.10].CGColor,
+                                 (__bridge id)[UIColor colorWithWhite:0.0 alpha:0.26].CGColor];
+        _tintGradient.locations = @[@0.0, @0.55, @1.0];
+        _tintGradient.startPoint = CGPointMake(0.5, 0.0);
+        _tintGradient.endPoint = CGPointMake(0.5, 1.0);
+        [_tintView.layer addSublayer:_tintGradient];
+        [self addSubview:_tintView];
+
+        _sheenView = [UIView new];
+        _sheenView.userInteractionEnabled = NO;
+        _sheenGradient = [CAGradientLayer layer];
+        _sheenGradient.colors = @[(__bridge id)[UIColor colorWithWhite:1.0 alpha:0.16].CGColor,
+                                  (__bridge id)[UIColor colorWithWhite:1.0 alpha:0.05].CGColor,
+                                  (__bridge id)[UIColor colorWithWhite:1.0 alpha:0.0].CGColor];
+        _sheenGradient.locations = @[@0.0, @0.45, @1.0];
+        _sheenGradient.startPoint = CGPointMake(0.0, 0.0);
+        _sheenGradient.endPoint = CGPointMake(0.35, 0.55);
+        [_sheenView.layer addSublayer:_sheenGradient];
+        [self addSubview:_sheenView];
 
         _artworkView = [UIImageView new];
         _artworkView.contentMode = UIViewContentModeScaleAspectFill;
@@ -413,12 +447,20 @@ static const CGFloat PGPanelHeight = 200.0;
         _titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
         _titleLabel.textColor = UIColor.whiteColor;
         _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        _titleLabel.layer.shadowColor = UIColor.blackColor.CGColor;
+        _titleLabel.layer.shadowOpacity = 0.45;
+        _titleLabel.layer.shadowRadius = 3.0;
+        _titleLabel.layer.shadowOffset = CGSizeMake(0.0, 1.0);
         [self addSubview:_titleLabel];
 
         _subtitleLabel = [UILabel new];
         _subtitleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular];
-        _subtitleLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
+        _subtitleLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.78];
         _subtitleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        _subtitleLabel.layer.shadowColor = UIColor.blackColor.CGColor;
+        _subtitleLabel.layer.shadowOpacity = 0.40;
+        _subtitleLabel.layer.shadowRadius = 3.0;
+        _subtitleLabel.layer.shadowOffset = CGSizeMake(0.0, 1.0);
         [self addSubview:_subtitleLabel];
 
         _elapsedLabel = [self timeLabelWithAlignment:NSTextAlignmentLeft];
@@ -635,12 +677,76 @@ static const CGFloat PGPanelHeight = 200.0;
 
 #pragma mark 布局
 
+/// 系统材质的模糊半径是固定的（UltraThin 大概只有 20 出头），放大到 42 才有真正的
+/// "毛玻璃"观感：背后的色块完全化开，只剩一片有颜色的雾。
+///
+/// 走的是 UIVisualEffectView 内部的 `_UIVisualEffectBackdropView`，它把 CAFilter 数组
+/// 挂在 `filters` 上。这一段全是私有层级：类名、key、filter 名任何一个对不上就什么都不做，
+/// 所以每一步都用 @try 包住 —— 在 SpringBoard 里崩一次就是安全模式，不能赌。
+static const CGFloat PGBackdropBlurRadius = 42.0;
+
+- (void)enlargeBackdropBlurInView:(UIView *)view depth:(NSInteger)depth {
+    if (!view || depth < 0) return;
+
+    NSString *className = NSStringFromClass(view.class);
+    NSRange match = [className rangeOfString:@"backdrop" options:NSCaseInsensitiveSearch];
+    if (match.location != NSNotFound) {
+        @try {
+            id filters = [view valueForKey:@"filters"];
+            if ([filters isKindOfClass:[NSArray class]]) {
+                NSMutableArray *updated = [NSMutableArray arrayWithCapacity:[filters count]];
+                BOOL changed = NO;
+                for (id filter in (NSArray *)filters) {
+                    NSString *name = nil;
+                    @try {
+                        name = [filter valueForKey:@"name"];
+                    } @catch (NSException *exception) {
+                        (void)exception;
+                    }
+                    if ([name isKindOfClass:[NSString class]] &&
+                        [name rangeOfString:@"blur" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                        @try {
+                            [filter setValue:@(PGBackdropBlurRadius) forKey:@"inputRadius"];
+                            changed = YES;
+                        } @catch (NSException *exception) {
+                            (void)exception;
+                        }
+                    }
+                    [updated addObject:filter];
+                }
+                if (changed) {
+                    [view setValue:updated forKey:@"filters"];
+                    PGLog(@"面板: 模糊半径已放大到 %.0f", PGBackdropBlurRadius);
+                }
+            }
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        return;
+    }
+
+    for (UIView *subview in view.subviews) {
+        [self enlargeBackdropBlurInView:subview depth:depth - 1];
+    }
+}
+
 - (void)layoutSubviews {
     [super layoutSubviews];
 
     CGFloat width = CGRectGetWidth(self.bounds);
     CGFloat height = CGRectGetHeight(self.bounds);
     _blurView.frame = self.bounds;
+    _tintView.frame = self.bounds;
+    _tintGradient.frame = _tintView.bounds;
+    _sheenView.frame = self.bounds;
+    _sheenGradient.frame = _sheenView.bounds;
+
+    // 第一次上屏时把系统材质的模糊半径拉大（默认半径偏小，看着像"半透明色块"）。
+    // 这是私有层级，某些系统上会失败，失败就维持系统默认，绝不能让它把 SpringBoard 带崩。
+    if (!_didBoostBlur && width > 0.0) {
+        _didBoostBlur = YES;
+        [self enlargeBackdropBlurInView:_blurView depth:4];
+    }
 
     CGFloat artSize = PGPanelArtworkSize;
     _artworkView.frame = CGRectMake(PGPanelPadding, PGPanelPadding, artSize, artSize);
