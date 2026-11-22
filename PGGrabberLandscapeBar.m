@@ -35,6 +35,12 @@ static const double PGLandscapePortraitVeto = 0.30;
 /// 加速度计样本有效期。超过这个时间没有新样本就认为运动服务没工作，改用软件来源。
 static const CFTimeInterval PGLandscapeGravityMaxAge = 2.0;
 
+/// 判定为横屏后，先等这么久再显示。旋转过程中窗口坐标系正在翻转，此时立刻画出来会"闪一下"。
+static const CFTimeInterval PGLandscapeShowDelay = 0.15;
+
+/// 显示淡入时长，避免胶囊硬生生"啪"一下出现。
+static const NSTimeInterval PGLandscapeFadeInDuration = 0.14;
+
 /// 加速计启动失败后的重试间隔与次数。dyld 早期 CoreMotion 常报不可用，不能一次失败就永久放弃。
 static const CFTimeInterval PGLandscapeMotionRetryInterval = 3.0;
 static const NSInteger PGLandscapeMotionMaxAttempts = 20;
@@ -285,6 +291,27 @@ static BOOL PGStartFBSObserver(void) {
 
 @end
 
+/// 承载胶囊的容器。窗口尺寸一变（旋转）UIKit 就会同步回调 layoutSubviews，
+/// 胶囊在旋转动画的每一帧都贴在正确的边上，不会出现"先错位、等下一次轮询才跳回来"的闪动。
+@class PGLandscapeBar;
+
+@interface PGLandscapeBar (PGPlacement)
+- (void)placeBarInBounds:(CGRect)bounds;
+@end
+
+@interface PGLandscapeHostView : UIView
+@property (nonatomic, weak, nullable) PGLandscapeBar *bar;
+@end
+
+@implementation PGLandscapeHostView
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self.bar placeBarInBounds:self.bounds];
+}
+
+@end
+
 /// 只负责显示、永不抢焦点：常驻块必须完全穿透触摸。
 @interface PGLandscapeBarWindow : UIWindow
 @end
@@ -346,6 +373,13 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 /// 上次排版是不是"贴顶边"（否则贴底边）。用于判断是否需要重排。
 @property (nonatomic, assign) BOOL laidOutAnchorAtTop;
 @property (nonatomic, assign) CGSize laidOutScreenSize;
+/// 当前胶囊尺寸。量一次缓存起来，旋转动画期间每帧重排只做几何计算，不重复量文字。
+@property (nonatomic, assign) CGFloat barLength;
+@property (nonatomic, assign) CGFloat barThickness;
+/// 当前"哪一侧长边朝上"。容器 layoutSubviews 重排时用它，不必重新读重力。
+@property (nonatomic, assign) BOOL anchorLeftEdgeUp;
+/// 进入横屏的时间戳，用于"稳定 150ms 再显示"。
+@property (nonatomic, assign) CFTimeInterval landscapeSince;
 /// 最近一次解析结果，供日志/诊断弹窗使用。
 @property (nonatomic, copy) NSString *resolvedSource;
 @property (nonatomic, copy, nullable) NSString *lastSnapshot;
@@ -484,6 +518,17 @@ static UIWindowScene *PGLandscapeHostScene(void) {
             PGLog(@"CoreMotion: 首个样本 x=%.3f y=%.3f z=%.3f",
                   data.acceleration.x, data.acceleration.y, data.acceleration.z);
         }
+
+        // 姿态一旦跨过阈值就立刻重算，不必等 0.4s 轮询 —— 手机转到位后胶囊马上归位。
+        static volatile int lastPose = 0;
+        int pose = lastPose;
+        if (data.acceleration.x >= PGLandscapeEnterThreshold) pose = 1;
+        else if (data.acceleration.x <= -PGLandscapeEnterThreshold) pose = -1;
+        else if (fabs(data.acceleration.x) < PGLandscapePortraitVeto) pose = 0;
+        if (pose != lastPose) {
+            lastPose = pose;
+            PGRequestRefresh();
+        }
     }];
 }
 
@@ -615,12 +660,17 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 
     if (!landscape) {
         // 竖屏一律隐藏 —— 这是功能定义，不做"竖屏也常驻"的兼容。
+        self.landscapeSince = 0.0;
         [self hideBar];
         [self logSnapshotShown:NO note:[@"portrait/" stringByAppendingString:source]];
         return;
     }
 
-    // 位置纠错在排版里处理（贴顶 / 贴底），这里只负责把方向事实传下去。
+    // 刚转过来时窗口坐标系还在翻转，等方向稳定一小会儿再画，避免闪一下。
+    CFTimeInterval now = CACurrentMediaTime();
+    if (self.landscapeSince <= 0.0) self.landscapeSince = now;
+    if (!self.visible && now - self.landscapeSince < PGLandscapeShowDelay) return;
+
     [self showBarLeftEdgeUp:leftEdgeUp];
     [self logSnapshotShown:YES note:[@"show/" stringByAppendingString:source]];
 }
@@ -659,10 +709,21 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         [self.bar startUpdating];
         self.updating = YES;
     }
+    self.anchorLeftEdgeUp = leftEdgeUp;
     [self layoutBarLeftEdgeUp:leftEdgeUp];
-    self.bar.hidden = NO;
     self.window.hidden = NO;
-    [self.window bringSubviewToFront:self.bar];
+
+    if (!self.visible) {
+        // 淡入而不是"啪"一下出现，旋转刚结束时观感更干净。
+        self.bar.hidden = NO;
+        self.bar.alpha = 0.0;
+        [UIView animateWithDuration:PGLandscapeFadeInDuration
+                              delay:0.0
+                            options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                         animations:^{
+            self.bar.alpha = 1.0;
+        } completion:nil];
+    }
     self.visible = YES;
 }
 
@@ -692,18 +753,26 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     window.accessibilityElementsHidden = YES;
     window.hidden = YES;
 
+    // 根视图换成自定义容器：它随窗口一起变尺寸，旋转动画每一帧都会回调 layoutSubviews 重排胶囊。
+    PGLandscapeHostView *host = [[PGLandscapeHostView alloc] initWithFrame:window.bounds];
+    host.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    host.backgroundColor = UIColor.clearColor;
+    host.userInteractionEnabled = NO;
+    host.bar = self;
+
     UIViewController *controller = [[UIViewController alloc] init];
-    controller.view.backgroundColor = UIColor.clearColor;
-    controller.view.userInteractionEnabled = NO;
+    controller.view = host;
     window.rootViewController = controller;
 
     PGLandscapeBarView *bar = [[PGLandscapeBarView alloc] initWithFrame:CGRectZero];
     bar.hidden = YES;
-    [controller.view addSubview:bar];
+    [host addSubview:bar];
 
     self.window = window;
     self.bar = bar;
     self.laidOut = NO;
+    self.barLength = 0.0;
+    self.barThickness = 0.0;
 
     PGLog(@"窗口已创建: scene=%@ bounds=%.0fx%.0f level=%.0f",
           scene ? @"有" : @"无(legacy)",
@@ -714,62 +783,64 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 - (void)layoutBarLeftEdgeUp:(BOOL)leftEdgeUp {
     if (!self.window || !self.bar) return;
 
-    // 关键：坐标空间一律取窗口自己的 bounds，绝不能再拿 UIScreen.mainScreen.bounds 去改窗口 frame。
-    // 横屏时这个窗口的 bounds 会被系统改成 932x430（宽 > 高），此时用户视角的"最上方"就是 y=0 那条长边；
-    // 旧代码把竖屏的 430x932 当基准，算出来的中心点落在横屏空间的右侧边缘 —— 这就是"块跑到右边"的根因。
     CGRect space = self.window.bounds;
     CGFloat spaceWidth = CGRectGetWidth(space);
     CGFloat spaceHeight = CGRectGetHeight(space);
     if (spaceWidth <= 0.0 || spaceHeight <= 0.0) return;
 
-    // 横屏块固定贴顶边居中：不再提供"贴底部"开关 —— 语义一旦和用户预期错位就会跑到屏幕另一头，
-    // 这个功能只有一个正确答案。
-    BOOL anchorAtTop = YES;
     BOOL landscapeSpace = spaceWidth > spaceHeight;      // 窗口已按横屏铺开
 
     BOOL sameGeometry = self.laidOut &&
+                        self.barLength > 0.0 &&
                         self.laidOutLeftEdgeUp == leftEdgeUp &&
-                        self.laidOutAnchorAtTop == anchorAtTop &&
                         fabs(self.laidOutScreenSize.width - spaceWidth) < 0.5 &&
                         fabs(self.laidOutScreenSize.height - spaceHeight) < 0.5;
-    if (sameGeometry) return;
+    if (sameGeometry) {
+        // 尺寸没变，只按当前窗口重新摆一次位置（旋转动画中每帧都会走到这里）。
+        [self placeBarInBounds:space];
+        return;
+    }
 
-    // 胶囊的长轴可以沿着窗口的"长边"铺开，可用长度取空间的长边。
+    // 胶囊的长轴沿着窗口的长边铺开，可用长度取长边。
     CGFloat inset = PGLandscapeBarEdgeInset;
     CGFloat available = (landscapeSpace ? spaceWidth : spaceHeight) - 2.0 * inset - 24.0;
     CGSize size = [self.bar preferredContentSizeForMaxWidth:MAX(80.0, available)];
-    CGFloat barLength = MIN(MAX(size.width, 44.0), MAX(available, 44.0));
-    CGFloat barThickness = MAX(size.height, 20.0);
-
-    self.bar.transform = CGAffineTransformIdentity;
-    self.bar.bounds = CGRectMake(0.0, 0.0, barLength, barThickness);
-
-    CGPoint center = CGPointZero;
-    if (landscapeSpace) {
-        // 横屏空间：顶端居中，胶囊横着躺，文字方向天然是正的，不需要旋转。
-        CGFloat centerY = anchorAtTop ? (inset + barThickness / 2.0)
-                                      : (spaceHeight - inset - barThickness / 2.0);
-        center = CGPointMake(spaceWidth / 2.0, centerY);
-        self.bar.center = center;
-    } else {
-        // 兜底：窗口若仍停在竖屏基准（430x932），用户视角的顶边就是左右两条长边，
-        // 这时才需要把胶囊旋转 90° 贴边。
-        BOOL leftSide = anchorAtTop ? leftEdgeUp : !leftEdgeUp;
-        CGFloat centerX = leftSide ? (inset + barThickness / 2.0)
-                                   : (spaceWidth - inset - barThickness / 2.0);
-        center = CGPointMake(centerX, spaceHeight / 2.0);
-        self.bar.center = center;
-        self.bar.transform = CGAffineTransformMakeRotation(leftSide ? -M_PI_2 : M_PI_2);
-    }
+    self.barLength = MIN(MAX(size.width, 44.0), MAX(available, 44.0));
+    self.barThickness = MAX(size.height, 20.0);
 
     self.laidOut = YES;
     self.laidOutLeftEdgeUp = leftEdgeUp;
-    self.laidOutAnchorAtTop = anchorAtTop;
     self.laidOutScreenSize = CGSizeMake(spaceWidth, spaceHeight);
 
-    PGLog(@"排版: 横屏空间=%d 贴顶=%d 左边缘朝上=%d 空间=%.0fx%.0f 胶囊=%.0fx%.0f 中心=(%.0f,%.0f)",
-          landscapeSpace, anchorAtTop, leftEdgeUp, spaceWidth, spaceHeight,
-          barLength, barThickness, center.x, center.y);
+    [self placeBarInBounds:space];
+
+    PGLog(@"排版: 横屏空间=%d 左边缘朝上=%d 空间=%.0fx%.0f 胶囊=%.0fx%.0f",
+          landscapeSpace, leftEdgeUp, spaceWidth, spaceHeight, self.barLength, self.barThickness);
+}
+
+/// 只做几何摆放：横屏空间贴顶边居中；万一窗口仍是竖屏基准，就贴"物理朝上"的那条长边并旋转 90°。
+/// 两种分支在同一物理姿态下看起来是同一个位置，所以旋转过程中切换分支不会跳。
+- (void)placeBarInBounds:(CGRect)space {
+    if (!self.bar || self.barLength <= 0.0 || self.barThickness <= 0.0) return;
+    CGFloat spaceWidth = CGRectGetWidth(space);
+    CGFloat spaceHeight = CGRectGetHeight(space);
+    if (spaceWidth <= 0.0 || spaceHeight <= 0.0) return;
+
+    CGFloat inset = PGLandscapeBarEdgeInset;
+    self.bar.transform = CGAffineTransformIdentity;
+    self.bar.bounds = CGRectMake(0.0, 0.0, self.barLength, self.barThickness);
+
+    if (spaceWidth > spaceHeight) {
+        // 横屏坐标系：y=0 那条边就是用户视角的顶边，胶囊横着躺、居中。
+        self.bar.center = CGPointMake(spaceWidth / 2.0, inset + self.barThickness / 2.0);
+    } else {
+        // 竖屏坐标系（旋转未能同步到这里时）：用户视角的顶边是左右两条长边，胶囊旋转 90° 贴上去。
+        BOOL leftSide = self.anchorLeftEdgeUp;
+        CGFloat centerX = leftSide ? (inset + self.barThickness / 2.0)
+                                   : (spaceWidth - inset - self.barThickness / 2.0);
+        self.bar.center = CGPointMake(centerX, spaceHeight / 2.0);
+        self.bar.transform = CGAffineTransformMakeRotation(leftSide ? -M_PI_2 : M_PI_2);
+    }
 }
 
 - (void)hideBar {
@@ -777,10 +848,13 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         [self.bar stopUpdating];
         self.updating = NO;
     }
+    [self.bar.layer removeAllAnimations];
+    self.bar.alpha = 1.0;
     self.bar.hidden = YES;
     self.window.hidden = YES;
     self.laidOut = NO;
     self.visible = NO;
+    self.landscapeSince = 0.0;
 }
 
 - (void)teardownWindow {
