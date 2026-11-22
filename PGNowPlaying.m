@@ -52,6 +52,27 @@ static NSString *PGStringFromObject(id object, NSString *selectorName) {
     }
 }
 
+/// SpringBoard 自己的"当前前台 App"接口。比 LSApplicationWorkspace.frontmostApplication 可靠：
+/// 从桌面再进入 App 的那一下，后者会短暂返回 nil 或上一个 App，用它判断"是否后台播放"
+/// 就会一会儿"是"一会儿"不是"，胶囊上的歌名跟着忽有忽无。
+static NSString *PGSBFrontmostBundleIdentifier(void) {
+    static NSString *(*query)(void) = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                              RTLD_LAZY);
+        if (handle) query = (NSString *(*)(void))dlsym(handle, "SBFrontmostApplicationDisplayIdentifier");
+        if (!handle || !query) PGDebugLog(@"SpringBoardServices: 前台接口不可用(%d/%d)", handle != NULL, query != NULL);
+    });
+    if (!query) return nil;
+    @try {
+        NSString *value = query();
+        if ([value isKindOfClass:NSString.class] && value.length > 0) return value;
+    } @catch (__unused NSException *exception) {
+    }
+    return nil;
+}
+
 static NSString *PGFrontmostBundleIdentifier(void) {
     Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
     if (!workspaceClass) return nil;
@@ -189,7 +210,7 @@ static NSString *PGBundleIdentifierForPID(int pid) {
     [self fetchInfo];
     [self fetchIsPlaying];
     [self fetchClient];
-    self.frontmostBundleIdentifier = PGFrontmostBundleIdentifier();
+    self.frontmostBundleIdentifier = PGSBFrontmostBundleIdentifier() ?: PGFrontmostBundleIdentifier();
 }
 
 - (void)fetchInfo {

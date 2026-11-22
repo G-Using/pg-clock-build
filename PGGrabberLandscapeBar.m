@@ -19,7 +19,8 @@
 static const CGFloat PGLandscapeBarEdgeInset = 6.0;
 
 /// 轮询间隔。方向变化没有可靠且单一的公开通知可依赖，轮询只做几次属性比较，开销可忽略。
-static const NSTimeInterval PGLandscapePollInterval = 0.4;
+/// 0.25 秒是为了配合"竖屏确认 0.3 秒才收起"的防抖：转回竖屏后约 0.5 秒内就能藏掉。
+static const NSTimeInterval PGLandscapePollInterval = 0.25;
 
 /// 每多少次轮询重读一次偏好。tweak 在 dyld 早期加载时 CFPreferences 可能还没同步到最新值。
 static const NSInteger PGLandscapePreferenceRefreshTicks = 12;
@@ -42,6 +43,20 @@ static const CFTimeInterval PGLandscapeShowDelay = 0.15;
 
 /// 显示淡入时长，避免胶囊硬生生"啪"一下出现。
 static const NSTimeInterval PGLandscapeFadeInDuration = 0.14;
+
+/// 竖屏要连续确认这么久才收起。方向来源在切前台 / App 切换的瞬间会有一两次瞬时失准，
+/// 一失准就立刻藏、下一拍又显 —— 表现就是"一直闪"。宁可慢半拍藏，也不能闪。
+static const CFTimeInterval PGLandscapeHideDelay = 0.30;
+
+/// 收起后至少隔这么久才允许再次显示，避免"藏了又显"的抖动。
+static const CFTimeInterval PGLandscapeReshowDelay = 0.40;
+
+/// 显示后至少保持这么久，期间方向抖动不收起。
+static const CFTimeInterval PGLandscapeMinVisible = 0.60;
+
+/// 音乐区（歌名那一段）的显示 / 隐藏要先稳定这么久才生效。
+/// 正在播放的探针在切前台、App 切换、锁屏时会有一两次失准，宽度跟着来回跳就是闪。
+static const CFTimeInterval PGLandscapeMusicDebounce = 0.80;
 
 /// 加速计启动失败后的重试间隔与次数。dyld 早期 CoreMotion 常报不可用，不能一次失败就永久放弃。
 static const CFTimeInterval PGLandscapeMotionRetryInterval = 3.0;
@@ -525,6 +540,22 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 @property (nonatomic, assign) BOOL anchorLeftEdgeUp;
 /// 进入横屏的时间戳，用于"稳定 150ms 再显示"。
 @property (nonatomic, assign) CFTimeInterval landscapeSince;
+/// 进入竖屏的时间戳（0 = 当前不是竖屏），用于"连续确认 300ms 才收起"。
+@property (nonatomic, assign) CFTimeInterval portraitSince;
+@property (nonatomic, assign) CFTimeInterval lastShowTime;
+@property (nonatomic, assign) CFTimeInterval lastHideTime;
+/// 第一次出现才用淡入；之后重新显示直接给 alpha，避免每隔几百毫秒闪一次淡入。
+@property (nonatomic, assign) BOOL appearedOnce;
+/// 内容宽度变了（歌名长度变化），下一次排版要重新量尺寸。
+@property (nonatomic, assign) BOOL needsResize;
+/// 长按已经处理过，抑制紧随其后的那次 tap（否则面板一开就被自己关掉）。
+@property (nonatomic, assign) CFTimeInterval suppressTapUntil;
+/// 上次重建窗口的时间，用于给重建限流。
+@property (nonatomic, assign) CFTimeInterval lastWindowRebuild;
+/// 显示/隐藏抖动检测：窗口期内翻转次数，以及熔断到期时间。
+@property (nonatomic, assign) NSInteger toggleBurst;
+@property (nonatomic, assign) CFTimeInterval burstWindowStart;
+@property (nonatomic, assign) CFTimeInterval flickerLockUntil;
 /// 最近一次解析结果，供日志/诊断弹窗使用。
 @property (nonatomic, copy) NSString *resolvedSource;
 @property (nonatomic, copy, nullable) NSString *lastSnapshot;
@@ -535,6 +566,11 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 @property (nonatomic, strong, nullable) NSTimer *panelTimer;
 /// 是否已经在监听系统"正在播放"。
 @property (nonatomic, assign) BOOL musicMonitoring;
+/// 音乐区当前生效的可见状态，以及"待生效"的候选状态。
+@property (nonatomic, assign) BOOL musicAppliedVisible;
+@property (nonatomic, assign) BOOL musicHasApplied;
+@property (nonatomic, assign) BOOL musicPendingVisible;
+@property (nonatomic, assign) CFTimeInterval musicPendingSince;
 
 @end
 
@@ -624,8 +660,30 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     BOOL inBackground = playingApp.length == 0 || frontApp.length == 0 ||
                         ![playingApp isEqualToString:frontApp];
     BOOL hasText = item.title.length > 0 || item.artist.length > 0;
-    BOOL visible = preferences.landscapeMusic && item.isPlaying && hasText && inBackground;
+    BOOL desired = preferences.landscapeMusic && item.isPlaying && hasText && inBackground;
 
+    // 稳定化：这些探针（是否在播 / 播放的是哪个 App / 前台是哪个 App）在切前台、App 切换、
+    // 锁屏的瞬间会有一两次瞬时失准。直接跟着变，胶囊就会一会儿有歌名一会儿没有，
+    // 宽度来回跳 —— 用户看到的就是"一直闪"。新状态必须稳定 PGLandscapeMusicDebounce 才生效。
+    CFTimeInterval now = CACurrentMediaTime();
+    if (!self.musicHasApplied) {
+        self.musicHasApplied = YES;
+        self.musicAppliedVisible = desired;
+        self.musicPendingSince = 0.0;
+    } else if (desired == self.musicAppliedVisible) {
+        self.musicPendingSince = 0.0;
+    } else if (self.musicPendingSince <= 0.0 || self.musicPendingVisible != desired) {
+        self.musicPendingVisible = desired;
+        self.musicPendingSince = now;
+    } else if (now - self.musicPendingSince >= PGLandscapeMusicDebounce) {
+        self.musicAppliedVisible = desired;
+        self.musicPendingSince = 0.0;
+        PGLog(@"音乐区%@ (playing=%d app=%@ front=%@)",
+              desired ? @"显示" : @"收起", item.isPlaying,
+              playingApp ?: @"-", frontApp ?: @"-");
+    }
+
+    BOOL visible = self.musicAppliedVisible;
     [self.bar setMusicVisible:visible
                         title:item.title
                        artist:item.artist
@@ -638,11 +696,21 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 }
 
 - (void)handleBarTap:(UITapGestureRecognizer *)recognizer {
+    if (CACurrentMediaTime() < self.suppressTapUntil) return;   // 长按刚开过面板，别被同一串触摸关掉
     if (self.panelVisible) {
         [self hidePanel];
         return;
     }
     if (!self.bar.musicVisible) return;   // 没在放歌就别弹面板
+    [self showPanel];
+}
+
+- (void)handleBarLongPress:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateBegan) return;
+    if (self.panelVisible) return;
+    if (!self.bar.musicVisible) return;   // 没在放歌就别弹面板
+    // 长按结束后系统还会补一次 tap，抑制掉它，否则面板开了立刻又被关掉 —— 看着就是"闪"。
+    self.suppressTapUntil = CACurrentMediaTime() + 0.7;
     [self showPanel];
 }
 
@@ -912,26 +980,87 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         return;
     }
 
+    // 窗口挂在某个 UIScene 上。App 退到桌面再回来时，原先那个场景可能已经 unattached，
+    // 窗口成了"孤儿"：window.hidden = NO 只会亮一下又被系统收走 —— 这正是"再次进入一直闪"。
+    [self ensureWindowAttached];
+
     BOOL leftEdgeUp = NO;
     NSString *source = @"-";
     BOOL landscape = [self resolveLandscape:&leftEdgeUp source:&source];
     self.resolvedSource = source;
 
+    CFTimeInterval now = CACurrentMediaTime();
+
+    // 抖动熔断：几秒内"显示↔隐藏"来回超过阈值，就说明方向来源在抖（切前台、锁屏、
+    // 探针瞬时失准）。这段时间只认重力（物理事实），其它来源先不做决定 —— 否则用户
+    // 看到的就一直是闪。熔断到期自动解除，不会把块永久锁死。
+    if (now < self.flickerLockUntil && ![source hasPrefix:@"gravity"]) return;
+
     if (!landscape) {
         // 竖屏一律隐藏 —— 这是功能定义，不做"竖屏也常驻"的兼容。
         self.landscapeSince = 0.0;
+        if (!self.visible) {
+            self.portraitSince = 0.0;
+            [self logSnapshotShown:NO note:[@"portrait/" stringByAppendingString:source]];
+            return;
+        }
+        // 防抖：必须连续确认 PGLandscapeHideDelay 才真的收起。
+        // 否则方向探针抖一下就是一次"隐藏→显示"，看起来就是一直在闪。
+        if (self.portraitSince <= 0.0) self.portraitSince = now;
+        if (now - self.portraitSince < PGLandscapeHideDelay) return;
+        if (now - self.lastShowTime < PGLandscapeMinVisible) return;
+        [self noteToggleAt:now];
         [self hideBar];
+        self.lastHideTime = now;
         [self logSnapshotShown:NO note:[@"portrait/" stringByAppendingString:source]];
         return;
     }
 
+    self.portraitSince = 0.0;
+
     // 刚转过来时窗口坐标系还在翻转，等方向稳定一小会儿再画，避免闪一下。
-    CFTimeInterval now = CACurrentMediaTime();
     if (self.landscapeSince <= 0.0) self.landscapeSince = now;
-    if (!self.visible && now - self.landscapeSince < PGLandscapeShowDelay) return;
+    if (!self.visible) {
+        if (now - self.landscapeSince < PGLandscapeShowDelay) return;
+        // 刚藏起来又立刻显示，同样是"闪"。留一个最小间隔。
+        if (now - self.lastHideTime < PGLandscapeReshowDelay) return;
+        [self noteToggleAt:now];
+    }
 
     [self showBarLeftEdgeUp:leftEdgeUp];
     [self logSnapshotShown:YES note:[@"show/" stringByAppendingString:source]];
+}
+
+/// 记录一次"显示↔隐藏"翻转。4 秒内翻转 4 次就判定方向来源在抖，锁 3 秒只看重力。
+- (void)noteToggleAt:(CFTimeInterval)now {
+    if (self.burstWindowStart <= 0.0 || now - self.burstWindowStart > 4.0) {
+        self.burstWindowStart = now;
+        self.toggleBurst = 0;
+    }
+    self.toggleBurst++;
+    if (self.toggleBurst < 4) return;
+    self.toggleBurst = 0;
+    self.burstWindowStart = now;
+    if (now >= self.flickerLockUntil) {
+        self.flickerLockUntil = now + 3.0;
+        PGLog(@"显示/隐藏抖动，锁定当前状态 3 秒（只认重力）");
+    }
+}
+
+/// 窗口必须挂在一个"活着"的 UIScene 上。失效就整体重建，而不是对着一个孤儿窗口反复 hidden = NO。
+- (void)ensureWindowAttached {
+    if (!self.window) return;
+    UIWindowScene *scene = self.window.windowScene;
+    if (scene && scene.activationState != UISceneActivationStateUnattached) return;
+    // 一个可用场景都拿不到（多见于切前台 / 返回桌面的动画中间），先别拆，等下一次轮询。
+    if (!PGLandscapeHostScene()) return;
+    // 重建本身也会闪一下，限流：1.5 秒内最多一次。
+    CFTimeInterval now = CACurrentMediaTime();
+    if (self.lastWindowRebuild > 0.0 && now - self.lastWindowRebuild < 1.5) return;
+    self.lastWindowRebuild = now;
+    PGLog(@"窗口场景失效(scene=%@ state=%ld)，重建窗口",
+          scene ? @"有" : @"无", (long)(scene ? scene.activationState : -1));
+    [self teardownWindow];
 }
 
 - (NSString *)detailSnapshot {
@@ -973,16 +1102,26 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     self.window.hidden = NO;
 
     if (!self.visible) {
-        // 淡入而不是"啪"一下出现，旋转刚结束时观感更干净。
         self.bar.hidden = NO;
-        self.bar.alpha = 0.0;
-        [UIView animateWithDuration:PGLandscapeFadeInDuration
-                              delay:0.0
-                            options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
-                         animations:^{
+        // 只有"第一次出现"或"确实藏了一会儿"才淡入。若是在几百毫秒内又显回来，
+        // 再来一次淡入就是肉眼可见的闪 —— 直接给满透明度。
+        BOOL longGap = !self.appearedOnce ||
+                       (self.lastHideTime > 0.0 && CACurrentMediaTime() - self.lastHideTime > 1.2);
+        if (longGap) {
+            self.bar.alpha = 0.0;
+            [UIView animateWithDuration:PGLandscapeFadeInDuration
+                                  delay:0.0
+                                options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                             animations:^{
+                self.bar.alpha = 1.0;
+            } completion:nil];
+            self.appearedOnce = YES;
+        } else {
+            [self.bar.layer removeAllAnimations];
             self.bar.alpha = 1.0;
-        } completion:nil];
+        }
     }
+    self.lastShowTime = CACurrentMediaTime();
     self.visible = YES;
 }
 
@@ -1029,6 +1168,12 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self
                                                                          action:@selector(handleBarTap:)];
     [bar addGestureRecognizer:tap];
+    // 长按也能唤出播放面板（和点一下等价，按住不放更不容易误触）。
+    UILongPressGestureRecognizer *longPress =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleBarLongPress:)];
+    longPress.minimumPressDuration = 0.35;
+    longPress.allowableMovement = 14.0;
+    [bar addGestureRecognizer:longPress];
     [host addSubview:bar];
 
     PGLandscapeControlPanel *panel = [[PGLandscapeControlPanel alloc] initWithFrame:CGRectZero];
@@ -1046,7 +1191,7 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     bar.contentWidthDidChange = ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf || !strongSelf.visible) return;
-        strongSelf.laidOut = NO;
+        strongSelf.needsResize = YES;
         [strongSelf layoutBarLeftEdgeUp:strongSelf.anchorLeftEdgeUp];
     };
 
@@ -1076,12 +1221,12 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 
     BOOL landscapeSpace = spaceWidth > spaceHeight;      // 窗口已按横屏铺开
 
-    BOOL sameGeometry = self.laidOut &&
-                        self.barLength > 0.0 &&
-                        self.laidOutLeftEdgeUp == leftEdgeUp &&
-                        fabs(self.laidOutScreenSize.width - spaceWidth) < 0.5 &&
-                        fabs(self.laidOutScreenSize.height - spaceHeight) < 0.5;
-    if (sameGeometry) {
+    BOOL sameSpace = self.laidOut &&
+                     self.barLength > 0.0 &&
+                     self.laidOutLeftEdgeUp == leftEdgeUp &&
+                     fabs(self.laidOutScreenSize.width - spaceWidth) < 0.5 &&
+                     fabs(self.laidOutScreenSize.height - spaceHeight) < 0.5;
+    if (sameSpace && !self.needsResize) {
         // 尺寸没变，只按当前窗口重新摆一次位置（旋转动画中每帧都会走到这里）。
         [self placeBarInBounds:space];
         return;
@@ -1095,9 +1240,12 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     self.barThickness = MAX(size.height, 20.0);
 
     self.laidOut = YES;
+    self.needsResize = NO;
     self.laidOutLeftEdgeUp = leftEdgeUp;
     self.laidOutScreenSize = CGSizeMake(spaceWidth, spaceHeight);
 
+    // 尺寸变化就在下一帧直接生效（歌名来去已经做过稳定化，不会来回跳，
+    // 也就不需要给宽度做动画 —— 动画里的标签重排反而会有半帧错位）。
     [self placeBarInBounds:space];
 
     PGLog(@"排版: 横屏空间=%d 左边缘朝上=%d 空间=%.0fx%.0f 胶囊=%.0fx%.0f",
@@ -1161,8 +1309,10 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     self.bar.hidden = YES;
     self.window.hidden = YES;
     self.laidOut = NO;
+    self.needsResize = NO;
     self.visible = NO;
     self.landscapeSince = 0.0;
+    self.portraitSince = 0.0;
 }
 
 - (void)teardownWindow {
@@ -1177,7 +1327,11 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     self.panel = nil;
     self.panelVisible = NO;
     self.laidOut = NO;
+    self.needsResize = NO;
     self.visible = NO;
+    self.appearedOnce = NO;
+    self.barLength = 0.0;
+    self.barThickness = 0.0;
 }
 
 @end
