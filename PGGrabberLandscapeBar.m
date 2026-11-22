@@ -571,6 +571,9 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 @property (nonatomic, assign) BOOL musicHasApplied;
 @property (nonatomic, assign) BOOL musicPendingVisible;
 @property (nonatomic, assign) CFTimeInterval musicPendingSince;
+/// 最新一次算出来的"应不应该显示音乐区"。轮询每拍都重新算一遍，
+/// 不能只在 onChange 里算 —— 系统不一定发通知，那样"待生效"永远等不到下一拍。
+@property (nonatomic, assign) BOOL musicDesiredVisible;
 
 @end
 
@@ -660,7 +663,16 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     BOOL inBackground = playingApp.length == 0 || frontApp.length == 0 ||
                         ![playingApp isEqualToString:frontApp];
     BOOL hasText = item.title.length > 0 || item.artist.length > 0;
-    BOOL desired = preferences.landscapeMusic && item.isPlaying && hasText && inBackground;
+    self.musicDesiredVisible = preferences.landscapeMusic && item.isPlaying && hasText && inBackground;
+
+    [self evaluateMusicVisibilityWithItem:item];
+}
+
+/// 把"想要的可见状态"按 PGLandscapeMusicDebounce 稳定一段时间后落到胶囊上。
+/// 必须能被外部按拍调用（pollTick），否则状态一旦不再变化就再没人推进它 ——
+/// 表现就是"明明在放歌，歌名永远不出来"。
+- (void)evaluateMusicVisibilityWithItem:(PGNowPlaying *)item {
+    BOOL desired = self.musicDesiredVisible;
 
     // 稳定化：这些探针（是否在播 / 播放的是哪个 App / 前台是哪个 App）在切前台、App 切换、
     // 锁屏的瞬间会有一两次瞬时失准。直接跟着变，胶囊就会一会儿有歌名一会儿没有，
@@ -680,7 +692,7 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         self.musicPendingSince = 0.0;
         PGLog(@"音乐区%@ (playing=%d app=%@ front=%@)",
               desired ? @"显示" : @"收起", item.isPlaying,
-              playingApp ?: @"-", frontApp ?: @"-");
+              item.bundleIdentifier ?: @"-", item.frontmostBundleIdentifier ?: @"-");
     }
 
     BOOL visible = self.musicAppliedVisible;
@@ -952,6 +964,12 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     }
     if (self.active && !self.motionManager) {
         [self startMotionUpdatesIfNeeded];
+    }
+
+    // 音乐区每拍重新判一次：MediaRemote 的通知不一定来（后台播放尤其容易漏），
+    // 只靠 onChange 的话"待生效"状态永远等不到下一次判定，歌名就再也出不来。
+    if (self.active) {
+        [self applyNowPlaying:PGNowPlaying.sharedInstance];
     }
 
     [self refreshNow];

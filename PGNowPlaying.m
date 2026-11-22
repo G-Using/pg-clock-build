@@ -32,8 +32,8 @@ static void PGLoadMediaRemote(void) {
         PGMRGetClient = (void (*)(dispatch_queue_t, void (^)(id)))dlsym(handle, "MRMediaRemoteGetNowPlayingClient");
         PGMRGetPID = (void (*)(dispatch_queue_t, void (^)(int)))dlsym(handle, "MRMediaRemoteGetNowPlayingApplicationPID");
         PGMRSendCommand = (Boolean (*)(int, CFDictionaryRef))dlsym(handle, "MRMediaRemoteSendCommand");
-        PGDebugLog(@"MediaRemote: 已加载 注册=%d 状态=%d 命令=%d 客户端=%d",
-                   PGMRRegister != NULL, PGMRGetInfo != NULL,
+        PGDebugLog(@"MediaRemote: 已加载 注册=%d 信息=%d 播放态=%d 命令=%d 客户端=%d",
+                   PGMRRegister != NULL, PGMRGetInfo != NULL, PGMRGetIsPlaying != NULL,
                    PGMRSendCommand != NULL, PGMRGetClient != NULL);
     });
 }
@@ -78,10 +78,16 @@ static NSString *PGBundleIdentifierForPID(int pid) {
     if (!controllerClass) return nil;
     @try {
         id controller = ((id (*)(id, SEL))objc_msgSend)(controllerClass, @selector(sharedInstance));
-        SEL selector = @selector(applicationWithPid:);
-        if (![controller respondsToSelector:selector]) return nil;
-        id application = ((id (*)(id, SEL, int))objc_msgSend)(controller, selector, pid);
-        return PGStringFromObject(application, @"bundleIdentifier");
+        if (!controller) return nil;
+        // 不同系统版本这两个选择子有的有一个没有，挨个试，取到就算。
+        for (NSString *name in @[@"applicationWithPid:", @"applicationWithProcessIdentifier:"]) {
+            SEL selector = NSSelectorFromString(name);
+            if (![controller respondsToSelector:selector]) continue;
+            id application = ((id (*)(id, SEL, int))objc_msgSend)(controller, selector, pid);
+            NSString *bundle = PGStringFromObject(application, @"bundleIdentifier");
+            if (bundle.length) return bundle;
+        }
+        return nil;
     } @catch (__unused NSException *exception) {
         return nil;
     }
@@ -99,6 +105,18 @@ static NSString *PGBundleIdentifierForPID(int pid) {
 @property (nonatomic, copy) NSString *signature;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
 @property (nonatomic, strong, nullable) dispatch_queue_t queue;
+
+/// 下面三个是"到底在不在播"的三路独立信号，任意一路为真就算在播。
+/// 只信其中一路的话，某些后台（游戏里放歌）场景会一直读到 NO，歌名就永远出不来。
+@property (nonatomic, assign) BOOL mrIsPlaying;          // MRMediaRemoteGetNowPlayingApplicationIsPlaying
+@property (nonatomic, assign) BOOL ratePositive;         // kMRMediaRemoteNowPlayingInfoPlaybackRate > 0
+@property (nonatomic, assign) BOOL elapsedAdvancing;     // 播放进度在往前走
+@property (nonatomic, assign) double lastElapsed;
+@property (nonatomic, assign) BOOL hasElapsedSample;
+/// 诊断用：最近一次取到的原始信息，只在状态变化时打日志。
+@property (nonatomic, assign) double lastRate;
+/// "字典里没有标题"的键清单只打一次，别刷屏。
+@property (nonatomic, assign) BOOL loggedEmptyTitleKeys;
 @end
 
 @implementation PGNowPlaying
@@ -151,9 +169,9 @@ static NSString *PGBundleIdentifierForPID(int pid) {
         }
     }
 
-    // 兜底轮询：少数 App 不发声通知，2.5 秒对一次状态，代价可忽略。
+    // 兜底轮询：少数 App 不发声通知，1.5 秒对一次状态，代价可忽略。
     [self.pollTimer invalidate];
-    NSTimer *timer = [NSTimer timerWithTimeInterval:2.5
+    NSTimer *timer = [NSTimer timerWithTimeInterval:1.5
                                              target:self
                                            selector:@selector(handlePollTimer)
                                            userInfo:nil
@@ -180,6 +198,12 @@ static NSString *PGBundleIdentifierForPID(int pid) {
 }
 
 - (void)handleMediaNotification:(NSNotification *)notification {
+    // 通知里直接带着播放态，比再发一次查询快一拍，先用上。
+    id value = notification.userInfo[@"kMRMediaRemoteNowPlayingApplicationIsPlayingUserInfoKey"];
+    if ([value respondsToSelector:@selector(boolValue)]) {
+        self.mrIsPlaying = [value boolValue];
+        [self recomputePlaying];
+    }
     [self refresh];
 }
 
@@ -213,8 +237,8 @@ static NSString *PGBundleIdentifierForPID(int pid) {
     __weak typeof(self) weakSelf = self;
     PGMRGetIsPlaying(self.queue, ^(Boolean isPlaying) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            weakSelf.playing = isPlaying ? YES : NO;
-            [weakSelf notifyIfChanged];
+            weakSelf.mrIsPlaying = isPlaying ? YES : NO;
+            [weakSelf recomputePlaying];
         });
     });
 }
@@ -254,24 +278,69 @@ static NSString *PGBundleIdentifierForPID(int pid) {
     if (!dictionary) {
         self.title = nil;
         self.artist = nil;
-    } else {
-        id title = dictionary[@"kMRMediaRemoteNowPlayingInfoTitle"];
-        id artist = dictionary[@"kMRMediaRemoteNowPlayingInfoArtist"];
-        self.title = [title isKindOfClass:NSString.class] ? title : nil;
-        self.artist = [artist isKindOfClass:NSString.class] ? artist : nil;
+        self.ratePositive = NO;
+        self.elapsedAdvancing = NO;
+        self.hasElapsedSample = NO;
+        [self recomputePlaying];
+        return;
+    }
 
-        id rate = dictionary[@"kMRMediaRemoteNowPlayingInfoPlaybackRate"];
-        if ([rate respondsToSelector:@selector(doubleValue)]) {
-            // 有的设备 isPlaying 回调不来，用播放速率兜一下。
-            self.playing = [rate doubleValue] > 0.01;
+    id title = dictionary[@"kMRMediaRemoteNowPlayingInfoTitle"];
+    id artist = dictionary[@"kMRMediaRemoteNowPlayingInfoArtist"];
+    id album = dictionary[@"kMRMediaRemoteNowPlayingInfoAlbum"];
+    NSString *resolvedTitle = [title isKindOfClass:NSString.class] ? title : nil;
+    self.artist = [artist isKindOfClass:NSString.class] ? artist : nil;
+    if (resolvedTitle.length == 0) {
+        // 有的 App 只填专辑名；再不行就把字典里到底有哪些键打出来，下次一眼能看出差在哪。
+        if ([album isKindOfClass:NSString.class] && [album length]) {
+            resolvedTitle = album;
+        } else if (dictionary.count > 0 && !self.loggedEmptyTitleKeys) {
+            self.loggedEmptyTitleKeys = YES;
+            PGDebugLog(@"NowPlaying: 信息里没有标题，键=%@", [dictionary.allKeys componentsJoinedByString:@","]);
         }
     }
-    [self notifyIfChanged];
+    self.title = resolvedTitle;
+
+    // 信号二：播放速率。
+    id rate = dictionary[@"kMRMediaRemoteNowPlayingInfoPlaybackRate"];
+    if ([rate respondsToSelector:@selector(doubleValue)]) {
+        self.lastRate = [rate doubleValue];
+        self.ratePositive = self.lastRate > 0.01;
+    } else {
+        self.lastRate = 0.0;
+        self.ratePositive = NO;
+    }
+
+    // 信号三：播放进度在自己往前走。暂停时进度是冻住的，这一路顺带能识破
+    // "速率没上报"的 App（部分音乐 App 只在开始/结束时给一次速率）。
+    id elapsed = dictionary[@"kMRMediaRemoteNowPlayingInfoElapsedTime"];
+    if ([elapsed respondsToSelector:@selector(doubleValue)]) {
+        double value = [elapsed doubleValue];
+        if (self.hasElapsedSample) {
+            self.elapsedAdvancing = value > self.lastElapsed + 0.05;
+        } else {
+            self.elapsedAdvancing = NO;
+            self.hasElapsedSample = YES;
+        }
+        self.lastElapsed = value;
+    } else {
+        self.elapsedAdvancing = NO;
+        self.hasElapsedSample = NO;
+    }
+
+    [self recomputePlaying];
 }
 
 - (void)applyBundleIdentifier:(NSString *)bundleIdentifier pid:(int)pid {
     NSString *resolved = bundleIdentifier.length ? bundleIdentifier : PGBundleIdentifierForPID(pid);
     self.bundleIdentifier = resolved;
+    [self notifyIfChanged];
+}
+
+/// 三路信号取或。只信 MRMediaRemoteGetNowPlayingApplicationIsPlaying 会漏：
+/// 在某些 App（尤其是后台播放）上它稳定返回 NO，歌名就永远出不来。
+- (void)recomputePlaying {
+    _playing = self.mrIsPlaying || self.ratePositive || self.elapsedAdvancing;
     [self notifyIfChanged];
 }
 
@@ -284,11 +353,14 @@ static NSString *PGBundleIdentifierForPID(int pid) {
     if ([signature isEqualToString:self.signature]) return;
     BOOL firstTime = self.signature.length == 0;
     self.signature = signature;
-    if (firstTime) {
-        PGDebugLog(@"NowPlaying: 首个状态 playing=%d title=%@ app=%@ front=%@",
-                   self.playing, self.title ?: @"-", self.bundleIdentifier ?: @"-",
-                   self.frontmostBundleIdentifier ?: @"-");
-    }
+
+    // 变化才打一行，别刷屏；这行是排查"为什么没认出在放歌"的唯一依据。
+    PGDebugLog(@"NowPlaying: %@ playing=%d 标题=%@ 歌手=%@ 速率=%.2f MR播放态=%d 进度走=%d app=%@ front=%@",
+               firstTime ? @"首个状态" : @"状态变化",
+               self.playing, self.title ?: @"-", self.artist ?: @"-",
+               self.lastRate, self.mrIsPlaying, self.elapsedAdvancing,
+               self.bundleIdentifier ?: @"-", self.frontmostBundleIdentifier ?: @"-");
+
     if (self.onChange) self.onChange(self);
 }
 
