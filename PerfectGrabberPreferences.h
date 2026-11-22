@@ -12,10 +12,6 @@ FOUNDATION_EXPORT NSString *const PGPreferencesChangedNotification;
 @property (nonatomic, readonly) BOOL vibrationFeedback;
 @property (nonatomic, readonly) BOOL showOnSwipeUp;
 @property (nonatomic, readonly) BOOL landscapeAlwaysOn;
-/// 把横屏块改贴到另一条长边（默认贴顶边，打开后贴底边）。
-@property (nonatomic, readonly) BOOL landscapeFlipSide;
-/// 诊断：每 5 秒用系统弹窗把当前方向状态显示出来（一定能盖在全屏 App 上）。
-@property (nonatomic, readonly) BOOL debugAlertEnabled;
 @property (nonatomic, readonly) BOOL disable24Hour;
 @property (nonatomic, readonly) BOOL chargingIcon;
 @property (nonatomic, readonly) BOOL twoLine;

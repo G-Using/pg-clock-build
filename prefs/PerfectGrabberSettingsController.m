@@ -142,7 +142,6 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[PSSpecifier groupSpecifierWithName:@"触发方式"]];
     [items addObject:[self preferenceNamed:@"上滑时显示" key:@"ShowOnSwipeUp" defaultValue:@YES cell:PSSwitchCell]];
     [items addObject:[self preferenceNamed:@"横屏时显示（竖屏自动隐藏）" key:@"LandscapeAlwaysOn" defaultValue:@YES cell:PSSwitchCell]];
-    [items addObject:[self preferenceNamed:@"横屏块贴到屏幕底部（默认贴顶部居中）" key:@"LandscapeFlipSide" defaultValue:@NO cell:PSSwitchCell]];
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"显示"]];
     [items addObject:[self preferenceNamed:@"使用 12 小时制" key:@"Disable24H" defaultValue:@NO cell:PSSwitchCell]];
@@ -166,18 +165,17 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self preferenceNamed:@"启用上滑背景颜色" key:@"EnabledSwipeUpBackgroundColor" defaultValue:@NO cell:PSSwitchCell]];
     [items addObject:[self buttonNamed:@"上滑背景颜色" action:@selector(chooseSwipeUpBackgroundColor)]];
 
-    PSSpecifier *diagnostic = [PSSpecifier groupSpecifierWithName:@"排查"];
-    [diagnostic setProperty:@"打开下面的开关后，每 5 秒会弹出一个系统提示框，显示当前的重力数据与各路方向来源。横屏拿着手机时截图发出来即可定位问题。诊断日志：/var/mobile/Media/PerfectGrabber.log"
-                   forKey:PSFooterTextGroupKey];
-    [items addObject:diagnostic];
-    [items addObject:[self preferenceNamed:@"方向诊断弹窗（排查用）" key:@"DebugAlertEnabled" defaultValue:@NO cell:PSSwitchCell]];
+    PSSpecifier *nospec = [PSSpecifier groupSpecifierWithName:@"横屏块位置"];
+    [nospec setProperty:@"横屏时时间电量块固定显示在屏幕最上方、水平居中；竖屏时自动隐藏。"
+                 forKey:PSFooterTextGroupKey];
+    [items addObject:nospec];
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"操作"]];
     [items addObject:[self buttonNamed:@"恢复默认设置" action:@selector(onResetSettings)]];
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-15" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-16" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;
@@ -264,7 +262,7 @@ static void PGWriteValue(NSString *key, id value) {
 
 - (void)onResetSettings {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
-                      @"LandscapeFlipSide", @"DebugAlertEnabled", @"Disable24H", @"ChargingIcon",
+                      @"Disable24H", @"ChargingIcon",
                       @"TwoLine", @"TextColor", @"GrabberStyle", @"FontSize", @"FontStyle",
                       @"EnabledBackgroundColor", @"BackgroundColor",
                       @"EnabledSwipeUpBackgroundColor", @"SwipeUpBackgroundColor"];

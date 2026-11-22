@@ -8,8 +8,6 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
 @property (nonatomic, readwrite) BOOL vibrationFeedback;
 @property (nonatomic, readwrite) BOOL showOnSwipeUp;
 @property (nonatomic, readwrite) BOOL landscapeAlwaysOn;
-@property (nonatomic, readwrite) BOOL landscapeFlipSide;
-@property (nonatomic, readwrite) BOOL debugAlertEnabled;
 @property (nonatomic, readwrite) BOOL disable24Hour;
 @property (nonatomic, readwrite) BOOL chargingIcon;
 @property (nonatomic, readwrite) BOOL twoLine;
@@ -66,16 +64,16 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
                                  (__bridge CFStringRef)PGPreferencesDomain);
         CFPreferencesAppSynchronize((__bridge CFStringRef)PGPreferencesDomain);
     }
-    // 1.1-15 起横屏块改成"贴顶边居中"，LandscapeFlipSide 的语义从"换到左右另一侧"变成"改贴底边"。
-    // 旧版本里用户为了纠错可能把它打开过，升级后会莫名跑到屏幕底部；同时顺手关掉排查弹窗。
+    // 1.1-16 起「横屏块换边」与「方向诊断弹窗」两个开关被彻底移除（横屏固定贴顶边居中）。
+    // 用户机器上这两个键可能还是 true，清成 false，免得以后恢复相关逻辑时又被旧值阴到。
     NSString *placementKey = @"PGPlacementRevision";
-    if ([[self valueForKey:placementKey fallback:@0] integerValue] < 2) {
+    if ([[self valueForKey:placementKey fallback:@0] integerValue] < 3) {
         CFPreferencesSetAppValue(CFSTR("LandscapeFlipSide"), kCFBooleanFalse,
                                  (__bridge CFStringRef)PGPreferencesDomain);
         CFPreferencesSetAppValue(CFSTR("DebugAlertEnabled"), kCFBooleanFalse,
                                  (__bridge CFStringRef)PGPreferencesDomain);
         CFPreferencesSetAppValue((__bridge CFStringRef)placementKey,
-                                 (__bridge CFPropertyListRef)@2,
+                                 (__bridge CFPropertyListRef)@3,
                                  (__bridge CFStringRef)PGPreferencesDomain);
         CFPreferencesAppSynchronize((__bridge CFStringRef)PGPreferencesDomain);
     }
@@ -83,8 +81,6 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
     self.vibrationFeedback = [[self valueForKey:@"VibrationFeedback" fallback:@YES] boolValue];
     self.showOnSwipeUp = [[self valueForKey:@"ShowOnSwipeUp" fallback:@YES] boolValue];
     self.landscapeAlwaysOn = [[self valueForKey:@"LandscapeAlwaysOn" fallback:@YES] boolValue];
-    self.landscapeFlipSide = [[self valueForKey:@"LandscapeFlipSide" fallback:@NO] boolValue];
-    self.debugAlertEnabled = [[self valueForKey:@"DebugAlertEnabled" fallback:@NO] boolValue];
     self.disable24Hour = [[self valueForKey:@"Disable24H" fallback:@NO] boolValue];
     self.chargingIcon = [[self valueForKey:@"ChargingIcon" fallback:@YES] boolValue];
     self.twoLine = [[self valueForKey:@"TwoLine" fallback:@NO] boolValue];

@@ -25,9 +25,6 @@ static const NSInteger PGLandscapePreferenceRefreshTicks = 12;
 /// 每多少次轮询写一行状态日志（约 12 秒），便于事后定位。
 static const NSInteger PGLandscapeStatusLogTicks = 30;
 
-/// 诊断弹窗刷新间隔（轮询次数，约 5 秒）。
-static const NSInteger PGLandscapeAlertTicks = 12;
-
 /// 进入 / 退出横屏的重力阈值（带滞回，避免握持在临界角度时块疯狂闪）。
 static const double PGLandscapeEnterThreshold = 0.55;   // 约 33°
 static const double PGLandscapeExitThreshold = 0.42;    // 约 25°
@@ -322,27 +319,9 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     return nil;
 }
 
-#pragma mark - 诊断弹窗
-
-static CFUserNotificationRef PGDiagnosticAlert = NULL;
-
-/// 用系统级警示框把当前状态直接显示在屏幕上。
-/// 这个弹窗由系统绘制，一定能盖在全屏 App 之上 —— 用它当作"看得见的日志"。
-static void PGPostDiagnosticAlert(NSString *title, NSString *message) {
-    if (PGDiagnosticAlert) {
-        CFRelease(PGDiagnosticAlert);
-        PGDiagnosticAlert = NULL;
-    }
-    NSDictionary *payload = @{
-        (__bridge NSString *)kCFUserNotificationAlertHeaderKey: title ?: @"PerfectGrabber",
-        (__bridge NSString *)kCFUserNotificationAlertMessageKey: message ?: @"",
-    };
-    SInt32 error = 0;
-    CFUserNotificationRef alert = CFUserNotificationCreate(kCFAllocatorDefault, 0,
-                                                           kCFUserNotificationPlainAlertLevel,
-                                                           &error, (__bridge CFDictionaryRef)payload);
-    if (alert) PGDiagnosticAlert = alert;
-}
+#pragma mark - 诊断弹窗已移除
+// 方向判定已经用真机日志验证过（重力 x=-0.65、样本充足、判定正确），
+// 那个每 5 秒弹出的系统提示框只会挡住画面，整块删掉。诊断信息仍然写 /var/mobile/Media/PerfectGrabber.log。
 
 #pragma mark - 横屏常驻块
 
@@ -416,9 +395,8 @@ static void PGPostDiagnosticAlert(NSString *title, NSString *message) {
     self.suspendTimer = nil;
     self.suspended = NO;
 
-    PGLog(@"reload: enabled=%d landscapeAlwaysOn=%d flip=%d alert=%d → active=%d",
-          preferences.isEnabled, preferences.landscapeAlwaysOn,
-          preferences.landscapeFlipSide, preferences.debugAlertEnabled, self.active);
+    PGLog(@"reload: enabled=%d landscapeAlwaysOn=%d → active=%d",
+          preferences.isEnabled, preferences.landscapeAlwaysOn, self.active);
 
     if (self.active) {
         PGStartFBSObserver();
@@ -606,10 +584,7 @@ static void PGPostDiagnosticAlert(NSString *title, NSString *message) {
 
     [self refreshNow];
 
-    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
-    if (preferences.debugAlertEnabled && self.pollTicks % PGLandscapeAlertTicks == 0) {
-        PGPostDiagnosticAlert(@"PerfectGrabber 方向诊断", [self detailSnapshot]);
-    } else if (self.active && self.pollTicks % PGLandscapeStatusLogTicks == 0) {
+    if (self.active && self.pollTicks % PGLandscapeStatusLogTicks == 0) {
         PGLog(@"状态 %@", [self detailSnapshot]);
     }
 }
@@ -747,8 +722,9 @@ static void PGPostDiagnosticAlert(NSString *title, NSString *message) {
     CGFloat spaceHeight = CGRectGetHeight(space);
     if (spaceWidth <= 0.0 || spaceHeight <= 0.0) return;
 
-    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
-    BOOL anchorAtTop = !preferences.landscapeFlipSide;   // 默认贴顶边，开关打开则贴底边
+    // 横屏块固定贴顶边居中：不再提供"贴底部"开关 —— 语义一旦和用户预期错位就会跑到屏幕另一头，
+    // 这个功能只有一个正确答案。
+    BOOL anchorAtTop = YES;
     BOOL landscapeSpace = spaceWidth > spaceHeight;      // 窗口已按横屏铺开
 
     BOOL sameGeometry = self.laidOut &&
