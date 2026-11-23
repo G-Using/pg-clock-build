@@ -197,7 +197,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-27" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-28" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     self.lastLandscapeAppCount = [self selectedLandscapeAppCount];

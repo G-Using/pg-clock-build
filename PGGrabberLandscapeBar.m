@@ -545,7 +545,7 @@ static const CGFloat PGPanelHeight = 200.0;
            duration:(double)duration
         artworkData:(NSData *)artworkData
          canOpenApp:(BOOL)canOpenApp {
-    _titleLabel.text = title.length ? title : @"正在播放";
+    _titleLabel.text = title.length ? title : (playing ? @"正在播放" : @"未在播放");
     _subtitleLabel.text = artist.length ? artist : @"";
 
     if (@available(iOS 13.0, *)) {
@@ -1370,10 +1370,11 @@ static BOOL PGFrontmostHasEverResolved(void) {
                  canOpenApp:item.bundleIdentifier.length > 0];
 }
 
-/// 面板里有没有内容可展示。原来这里卡的是"胶囊上音乐区可见"，那条件太严：
-/// 横屏游戏里播放态探针经常一抖，音乐区还来不及显示（0.8s 去抖），
-/// 用户这时候点一下就被直接 return —— 表现就是"王者里点了没反应"。
-/// 改成只要媒体会话里有曲目信息就允许弹面板。
+/// 面板里有没有内容可展示。
+/// ⚠️ 这个条件现在**只用来决定文案**，不再是能不能弹面板的门槛。
+/// 横屏游戏里 MediaRemote 的探针很不稳（有时连标题都取不到），只要拿它当门槛，
+/// 用户就会遇到"点一下完全没反应" —— 而他要的其实是"能操控控制台"。
+/// 面板里没有曲目时显示"未在播放"，播放/暂停、上一首、下一首照样能发命令。
 - (BOOL)hasPlayableMedia {
     if (self.bar.musicVisible) return YES;
     PGNowPlaying *item = PGNowPlaying.sharedInstance;
@@ -1381,22 +1382,27 @@ static BOOL PGFrontmostHasEverResolved(void) {
 }
 
 - (void)handleBarTap:(UITapGestureRecognizer *)recognizer {
+    PGLog(@"面板: 收到点击（panelVisible=%d 音乐区=%d 空间=%.0fx%.0f）",
+          self.panelVisible, self.bar.musicVisible,
+          CGRectGetWidth(self.window.bounds), CGRectGetHeight(self.window.bounds));
     if (CACurrentMediaTime() < self.suppressTapUntil) return;   // 长按刚开过面板，别被同一串触摸关掉
     if (self.panelVisible) {
         [self hidePanel];
         return;
     }
     if (![self hasPlayableMedia]) {
-        PGLog(@"面板: 点击忽略（没有正在播放的媒体信息）");
-        return;
+        PGLog(@"面板: 没有媒体信息，仍然弹出（内容显示为未在播放）");
     }
     [self showPanel];
 }
 
 - (void)handleBarLongPress:(UILongPressGestureRecognizer *)recognizer {
     if (recognizer.state != UIGestureRecognizerStateBegan) return;
+    PGLog(@"面板: 收到长按（panelVisible=%d 音乐区=%d）", self.panelVisible, self.bar.musicVisible);
     if (self.panelVisible) return;
-    if (![self hasPlayableMedia]) return;
+    if (![self hasPlayableMedia]) {
+        PGLog(@"面板: 长按且没有媒体信息，仍然弹出（内容显示为未在播放）");
+    }
     // 长按结束后系统还会补一次 tap，抑制掉它，否则面板开了立刻又被关掉 —— 看着就是"闪"。
     self.suppressTapUntil = CACurrentMediaTime() + 0.7;
     [self showPanel];
@@ -1416,17 +1422,22 @@ static BOOL PGFrontmostHasEverResolved(void) {
     self.panel.hidden = NO;
     self.panel.alpha = 0.0;
     [self.panel.superview bringSubviewToFront:self.panel];
-    [self placePanelInSpace:self.window.bounds];
+    CGRect space = self.window.bounds;
 
-    // placePanelInSpace 在"窗口坐标系不是横的"时会把面板藏起来（旋转动画中间）。这时候
-    // 不能留一个 panelVisible=YES 的死状态，否则下一次点击只会把它 hide 掉，等于点了没反应。
-    if (self.panel.hidden) {
+    // 窗口尺寸真的是 0（场景刚失效）就别弹了。不能留一个 panelVisible=YES 的死状态，
+    // 否则下一次点击只会把它 hide 掉，等于点了没反应。
+    if (CGRectGetWidth(space) <= 0.0 || CGRectGetHeight(space) <= 0.0) {
         self.panelVisible = NO;
+        self.panel.hidden = YES;
         self.panel.alpha = 1.0;
-        PGLog(@"面板: 当前空间 %.0fx%.0f 不是横屏坐标系，不弹",
-              CGRectGetWidth(self.window.bounds), CGRectGetHeight(self.window.bounds));
+        PGLog(@"面板: 窗口尺寸无效（%.0fx%.0f），不弹",
+              CGRectGetWidth(space), CGRectGetHeight(space));
         return;
     }
+
+    [self placePanelInSpace:space];
+
+    BOOL rotated = CGRectGetWidth(space) <= CGRectGetHeight(space);
 
     [UIView animateWithDuration:0.16
                           delay:0.0
@@ -1438,7 +1449,9 @@ static BOOL PGFrontmostHasEverResolved(void) {
     PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
     if (preferences.vibrationFeedback) AudioServicesPlaySystemSound(1519);
     [self schedulePanelHide];
-    PGLog(@"面板: 弹出 frame=%@ 标题=%@", NSStringFromCGRect(self.panel.frame), nowPlaying.title ?: @"-");
+    PGLog(@"面板: 弹出 frame=%@ 空间=%.0fx%.0f 旋转补偿=%d 标题=%@",
+          NSStringFromCGRect(self.panel.frame), CGRectGetWidth(space), CGRectGetHeight(space),
+          rotated, nowPlaying.title ?: @"-");
 }
 
 - (void)hidePanel {
@@ -2110,23 +2123,49 @@ static BOOL PGFrontmostHasEverResolved(void) {
     [self placePanelInSpace:space];
 }
 
-/// 面板挨着胶囊下沿居中摆放。竖屏坐标系里不做（旋转瞬间不显示面板，避免旋转补偿把面板甩到屏幕外）。
+/// 面板挨着胶囊"内侧"居中摆放。
+///
+/// ⚠️ 这里必须同时支持两种坐标系：
+/// - 横屏坐标系（窗口已按横屏铺开，932x430）：面板横着摆在胶囊下沿；
+/// - 竖屏坐标系（430x932）：**大多数游戏是自己转画面**，SpringBoard 的场景窗口并不会跟着转。
+///   胶囊靠 placeBarInBounds: 的旋转兜底显示出来了，面板以前却在这一步被直接藏掉 ——
+///   于是"进了游戏点一下没任何反应"，这就是 1.1-24 修过手势之后仍然弹不出的真正原因。
+///   现在把面板也旋转 90° 贴到胶囊同一侧，方向与胶囊一致。
 - (void)placePanelInSpace:(CGRect)space {
     if (!self.panel) return;
     CGFloat spaceWidth = CGRectGetWidth(space);
     CGFloat spaceHeight = CGRectGetHeight(space);
-    if (spaceWidth <= spaceHeight) {
-        self.panel.hidden = YES;
-        return;
-    }
+    // ⚠️ 这里绝不能碰 panel.hidden —— 每次方向轮询都会经 placeBarInBounds: 调到这里，
+    // 一旦在这里设 hidden = NO，收起状态的空面板就会被"排"到屏幕上。
+    // 显示/隐藏只由 showPanel / hidePanel 决定。
+    if (spaceWidth <= 0.0 || spaceHeight <= 0.0) return;
 
-    CGFloat panelWidth = MIN(460.0, MAX(300.0, spaceWidth - 80.0));
+    BOOL landscapeSpace = spaceWidth > spaceHeight;
+    // 用户视角的"宽度"：横屏坐标系是 spaceWidth，竖屏坐标系是 spaceHeight。
+    CGFloat visualWidth = landscapeSpace ? spaceWidth : spaceHeight;
+    CGFloat panelWidth = MIN(460.0, MAX(280.0, visualWidth - 80.0));
     CGFloat panelHeight = PGPanelHeight;
+    CGFloat barThickness = self.barThickness > 0.0 ? self.barThickness : 30.0;
+
     self.panel.transform = CGAffineTransformIdentity;
     self.panel.bounds = CGRectMake(0.0, 0.0, panelWidth, panelHeight);
 
-    CGFloat barBottom = self.bar ? CGRectGetMaxY(self.bar.frame) : 30.0;
-    self.panel.center = CGPointMake(spaceWidth / 2.0, barBottom + 10.0 + panelHeight / 2.0);
+    if (landscapeSpace) {
+        CGFloat barBottom = self.bar ? CGRectGetMaxY(self.bar.frame) : barThickness;
+        self.panel.center = CGPointMake(spaceWidth / 2.0, barBottom + 10.0 + panelHeight / 2.0);
+        return;
+    }
+
+    // 竖屏坐标系：胶囊贴在某条长边上（anchorLeftEdgeUp 决定贴左还是贴右），
+    // 面板往"内侧"（用户视角的下方）偏移；旋转后沿 x 轴占的是 panelHeight，所以偏移量用它的一半。
+    BOOL leftSide = self.anchorLeftEdgeUp;
+    CGFloat barCenterX = leftSide
+        ? (PGLandscapeBarEdgeInset + barThickness / 2.0)
+        : (spaceWidth - PGLandscapeBarEdgeInset - barThickness / 2.0);
+    CGFloat innerOffset = barThickness / 2.0 + 10.0 + panelHeight / 2.0;
+    self.panel.center = CGPointMake(leftSide ? (barCenterX + innerOffset) : (barCenterX - innerOffset),
+                                    spaceHeight / 2.0);
+    self.panel.transform = CGAffineTransformMakeRotation(leftSide ? -M_PI_2 : M_PI_2);
 }
 
 - (void)hideBar {
