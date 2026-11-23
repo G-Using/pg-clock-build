@@ -324,6 +324,14 @@ static BOOL PGStartFBSObserver(void) {
                                kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
 }
 
+/// 胶囊只有 30 来点高，横屏打游戏时手指很容易点偏上下边缘。
+/// 命中区上下各放宽 10pt、左右 6pt —— 只影响 hitTest，视觉尺寸不变；
+/// 屏幕最上面那条边在游戏里也没有可点的东西，吃掉它没有代价。
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    CGRect hitBounds = CGRectInset(self.bounds, -6.0, -10.0);
+    return CGRectContainsPoint(hitBounds, point);
+}
+
 @end
 
 #pragma mark - 播放控制面板
@@ -872,6 +880,53 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 // 方向判定已经用真机日志验证过（重力 x=-0.65、样本充足、判定正确），
 // 那个每 5 秒弹出的系统提示框只会挡住画面，整块删掉。诊断信息仍然写 /var/mobile/Media/PerfectGrabber.log。
 
+#pragma mark - 当前前台 App
+
+/// 当前前台 App 的 bundle id，250ms 缓存（轮询 250ms 一拍，等于每拍一次）。
+/// 走 LSApplicationWorkspace 的公开私有方法，不用 SBFrontmostApplicationDisplayIdentifier
+/// —— 那个接口在 dyld 阶段返回过垃圾指针，直接把 SpringBoard 带进安全模式。
+/// 取不到就返回 nil，调用方按"放行"处理：宁可多显示，也别让探针失败把功能吞掉。
+static NSString *PGCurrentFrontmostBundleID(void) {
+    static NSString *cachedIdentifier = nil;
+    static CFTimeInterval cachedAt = 0.0;
+
+    CFTimeInterval now = CACurrentMediaTime();
+    if (cachedAt > 0.0 && now - cachedAt < 0.25) return cachedIdentifier;
+
+    cachedAt = now;
+    cachedIdentifier = nil;
+
+    Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
+    if (!workspaceClass) return nil;
+
+    id workspace = nil;
+    @try {
+        workspace = ((id (*)(id, SEL))objc_msgSend)(workspaceClass, @selector(defaultWorkspace));
+    } @catch (NSException *exception) {
+        workspace = nil;
+    }
+    if (!workspace) return nil;
+
+    SEL frontSelector = @selector(frontmostApplication);
+    if (![(NSObject *)workspace respondsToSelector:frontSelector]) return nil;
+
+    id application = nil;
+    @try {
+        application = ((id (*)(id, SEL))objc_msgSend)(workspace, frontSelector);
+    } @catch (NSException *exception) {
+        application = nil;
+    }
+    if (!application) return nil;
+
+    @try {
+        id bundleIdentifier = ((id (*)(id, SEL))objc_msgSend)(application, @selector(bundleIdentifier));
+        if ([bundleIdentifier isKindOfClass:[NSString class]]) cachedIdentifier = bundleIdentifier;
+    } @catch (NSException *exception) {
+        cachedIdentifier = nil;
+    }
+    return cachedIdentifier;
+}
+
 #pragma mark - 横屏常驻块
 
 @interface PGLandscapeBar ()
@@ -936,6 +991,8 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 /// 最新一次算出来的"应不应该显示音乐区"。轮询每拍都重新算一遍，
 /// 不能只在 onChange 里算 —— 系统不一定发通知，那样"待生效"永远等不到下一拍。
 @property (nonatomic, assign) BOOL musicDesiredVisible;
+/// 上一次因为"不在白名单"被隐藏的 App，用来只打一次日志（每拍都打会刷爆文件）。
+@property (nonatomic, copy, nullable) NSString *lastBlockedApp;
 
 @end
 
@@ -1064,9 +1121,10 @@ static UIWindowScene *PGLandscapeHostScene(void) {
                       playing:item.isPlaying];
     if (visible) {
         [self syncPanelWithNowPlaying:item];
-    } else if (self.panelVisible) {
-        [self hidePanel];
     }
+    // 面板不跟着音乐区一起收。用户点开之后就该由用户（再点一次）或 6 秒超时来收起；
+    // 后台播放状态抖一下就把面板收掉，表现就是"点了没反应 / 闪一下就没了"
+    // —— 横屏游戏（王者这类）里播放态探针本来就不稳，不能拿它决定面板的生死。
 }
 
 /// 面板要的字段比胶囊多（进度、封面、能不能跳回播放器），统一在这里灌进去。
@@ -1081,20 +1139,33 @@ static UIWindowScene *PGLandscapeHostScene(void) {
                  canOpenApp:item.bundleIdentifier.length > 0];
 }
 
+/// 面板里有没有内容可展示。原来这里卡的是"胶囊上音乐区可见"，那条件太严：
+/// 横屏游戏里播放态探针经常一抖，音乐区还来不及显示（0.8s 去抖），
+/// 用户这时候点一下就被直接 return —— 表现就是"王者里点了没反应"。
+/// 改成只要媒体会话里有曲目信息就允许弹面板。
+- (BOOL)hasPlayableMedia {
+    if (self.bar.musicVisible) return YES;
+    PGNowPlaying *item = PGNowPlaying.sharedInstance;
+    return item.title.length > 0 || item.artist.length > 0;
+}
+
 - (void)handleBarTap:(UITapGestureRecognizer *)recognizer {
     if (CACurrentMediaTime() < self.suppressTapUntil) return;   // 长按刚开过面板，别被同一串触摸关掉
     if (self.panelVisible) {
         [self hidePanel];
         return;
     }
-    if (!self.bar.musicVisible) return;   // 没在放歌就别弹面板
+    if (![self hasPlayableMedia]) {
+        PGLog(@"面板: 点击忽略（没有正在播放的媒体信息）");
+        return;
+    }
     [self showPanel];
 }
 
 - (void)handleBarLongPress:(UILongPressGestureRecognizer *)recognizer {
     if (recognizer.state != UIGestureRecognizerStateBegan) return;
     if (self.panelVisible) return;
-    if (!self.bar.musicVisible) return;   // 没在放歌就别弹面板
+    if (![self hasPlayableMedia]) return;
     // 长按结束后系统还会补一次 tap，抑制掉它，否则面板开了立刻又被关掉 —— 看着就是"闪"。
     self.suppressTapUntil = CACurrentMediaTime() + 0.7;
     [self showPanel];
@@ -1102,7 +1173,10 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 
 - (void)showPanel {
     if (!self.panel || self.panelVisible) return;
-    if (self.window.bounds.size.width <= self.window.bounds.size.height) return;   // 仅横屏空间可用
+    if (!self.window) {
+        PGLog(@"面板: 没有窗口，忽略");
+        return;
+    }
 
     PGNowPlaying *nowPlaying = PGNowPlaying.sharedInstance;
     [self syncPanelWithNowPlaying:nowPlaying];
@@ -1110,7 +1184,19 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     self.panelVisible = YES;
     self.panel.hidden = NO;
     self.panel.alpha = 0.0;
+    [self.panel.superview bringSubviewToFront:self.panel];
     [self placePanelInSpace:self.window.bounds];
+
+    // placePanelInSpace 在"窗口坐标系不是横的"时会把面板藏起来（旋转动画中间）。这时候
+    // 不能留一个 panelVisible=YES 的死状态，否则下一次点击只会把它 hide 掉，等于点了没反应。
+    if (self.panel.hidden) {
+        self.panelVisible = NO;
+        self.panel.alpha = 1.0;
+        PGLog(@"面板: 当前空间 %.0fx%.0f 不是横屏坐标系，不弹",
+              CGRectGetWidth(self.window.bounds), CGRectGetHeight(self.window.bounds));
+        return;
+    }
+
     [UIView animateWithDuration:0.16
                           delay:0.0
                         options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
@@ -1121,6 +1207,7 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
     if (preferences.vibrationFeedback) AudioServicesPlaySystemSound(1519);
     [self schedulePanelHide];
+    PGLog(@"面板: 弹出 frame=%@ 标题=%@", NSStringFromCGRect(self.panel.frame), nowPlaying.title ?: @"-");
 }
 
 - (void)hidePanel {
@@ -1391,6 +1478,19 @@ static UIWindowScene *PGLandscapeHostScene(void) {
         return;
     }
 
+    // 白名单：只对指定 App 生效。拿不到前台 App、或名单为空时一律放行 ——
+    // 功能可用性优先，不能因为探针取不到就把用户的横屏块吞掉。
+    if (![self isFrontmostAppAllowed]) {
+        self.landscapeSince = 0.0;
+        self.portraitSince = 0.0;
+        if (self.visible) {
+            [self hideBar];
+            self.lastHideTime = CACurrentMediaTime();
+            [self logSnapshotShown:NO note:@"app-not-allowed"];
+        }
+        return;
+    }
+
     // 窗口挂在某个 UIScene 上。App 退到桌面再回来时，原先那个场景可能已经 unattached，
     // 窗口成了"孤儿"：window.hidden = NO 只会亮一下又被系统收走 —— 这正是"再次进入一直闪"。
     [self ensureWindowAttached];
@@ -1472,6 +1572,36 @@ static UIWindowScene *PGLandscapeHostScene(void) {
     PGLog(@"窗口场景失效(scene=%@ state=%ld)，重建窗口",
           scene ? @"有" : @"无", (long)(scene ? scene.activationState : -1));
     [self teardownWindow];
+}
+
+/// 白名单判定。三种情况直接放行：
+/// 1) 没开过滤；2) 名单为空（等同不过滤）；3) 拿不到前台 App（探针失败）。
+- (BOOL)isFrontmostAppAllowed {
+    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
+    if (!preferences.landscapeAppFilterEnabled) {
+        self.lastBlockedApp = nil;
+        return YES;
+    }
+    NSArray<NSString *> *allowList = preferences.landscapeAppAllowList;
+    if (allowList.count == 0) {
+        self.lastBlockedApp = nil;
+        return YES;
+    }
+    NSString *frontmost = PGCurrentFrontmostBundleID();
+    if (frontmost.length == 0) {
+        self.lastBlockedApp = nil;
+        return YES;
+    }
+    if ([allowList containsObject:frontmost]) {
+        self.lastBlockedApp = nil;
+        return YES;
+    }
+    if (![self.lastBlockedApp isEqualToString:frontmost]) {
+        self.lastBlockedApp = frontmost;
+        PGLog(@"白名单: %@ 不在名单里（共 %lu 个）→ 隐藏横屏块",
+              frontmost, (unsigned long)allowList.count);
+    }
+    return NO;
 }
 
 - (NSString *)detailSnapshot {

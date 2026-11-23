@@ -11,6 +11,8 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
 @property (nonatomic, readwrite) BOOL landscapeMusic;
 @property (nonatomic, readwrite) BOOL landscapeMetrics;
 @property (nonatomic, readwrite) BOOL landscapeMetricsUsage;
+@property (nonatomic, readwrite) BOOL landscapeAppFilterEnabled;
+@property (nonatomic, copy, readwrite) NSArray<NSString *> *landscapeAppAllowList;
 @property (nonatomic, readwrite) BOOL landscapeCustomBackground;
 @property (nonatomic, readwrite) UIColor *landscapeBackgroundColor;
 @property (nonatomic, readwrite) BOOL disable24Hour;
@@ -89,6 +91,9 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
     self.landscapeMusic = [[self valueForKey:@"LandscapeMusic" fallback:@YES] boolValue];
     self.landscapeMetrics = [[self valueForKey:@"LandscapeMetrics" fallback:@YES] boolValue];
     self.landscapeMetricsUsage = [[self valueForKey:@"LandscapeMetricsUsage" fallback:@YES] boolValue];
+    self.landscapeAppFilterEnabled = [[self valueForKey:@"LandscapeAppFilterEnabled" fallback:@NO] boolValue];
+    id allowList = [self valueForKey:@"LandscapeAppAllowList" fallback:@[]];
+    self.landscapeAppAllowList = [allowList isKindOfClass:[NSArray class]] ? allowList : @[];
     self.landscapeCustomBackground = [[self valueForKey:@"LandscapeCustomBackground" fallback:@NO] boolValue];
     self.landscapeBackgroundColor =
         [PerfectGrabberPreferences colorFromHexString:[self valueForKey:@"LandscapeBackgroundColor" fallback:@"#00BFFF"]

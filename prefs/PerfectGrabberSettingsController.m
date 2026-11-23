@@ -1,4 +1,5 @@
 #import "PerfectGrabberSettingsController.h"
+#import "PGAppSelectionController.h"
 #import <Preferences/PSSpecifier.h>
 #import <Preferences/PSTableCell.h>
 #import <math.h>
@@ -165,6 +166,13 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self preferenceNamed:@"启用上滑背景颜色" key:@"EnabledSwipeUpBackgroundColor" defaultValue:@NO cell:PSSwitchCell]];
     [items addObject:[self buttonNamed:@"上滑背景颜色" action:@selector(chooseSwipeUpBackgroundColor)]];
 
+    PSSpecifier *scope = [PSSpecifier groupSpecifierWithName:@"生效范围"];
+    [scope setProperty:@"打开「仅指定 App 生效」后，只有下面列表里勾选的 App 在横屏时才显示横屏块，其它 App 横屏一律不显示（竖屏本来就不显示）。列表为空时等同于没开过滤，这样刚打开开关还没选 App 时不会什么都看不到。勾选后即时生效，不用注销。"
+                forKey:PSFooterTextGroupKey];
+    [items addObject:scope];
+    [items addObject:[self preferenceNamed:@"仅指定 App 生效" key:@"LandscapeAppFilterEnabled" defaultValue:@NO cell:PSSwitchCell]];
+    [items addObject:[self buttonNamed:@"选择 App…" action:@selector(chooseLandscapeApps)]];
+
     PSSpecifier *landscape = [PSSpecifier groupSpecifierWithName:@"横屏块"];
     [landscape setProperty:@"横屏块固定单排显示（CPU 指标 + 电池温度 + 时间 + 电量在同一行），贴在屏幕最上方居中；竖屏自动隐藏。CPU 默认显示实时占用率——iOS 不开放真正的瞬时主频，读到的\"最高频率\"在部分机型上并不可信（会把别的频率表读成 CPU 频率），想要看的话可以在下面切换。"
                     forKey:PSFooterTextGroupKey];
@@ -185,7 +193,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-23" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-24" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     return _specifiers;
@@ -253,6 +261,19 @@ static void PGWriteValue(NSString *key, id value) {
                        fallback:[UIColor colorWithRed:0 green:0.75 blue:1 alpha:1]];
 }
 
+- (void)chooseLandscapeApps {
+    PGAppSelectionController *controller = [[PGAppSelectionController alloc] init];
+    UINavigationController *navigation = self.navigationController;
+    if (navigation) {
+        [navigation pushViewController:controller animated:YES];
+        return;
+    }
+    // 极少数情况下设置页不在导航栈里，兜底用模态。
+    UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:controller];
+    wrapper.modalPresentationStyle = UIModalPresentationFormSheet;
+    [self presentViewController:wrapper animated:YES completion:nil];
+}
+
 - (void)storeSelectedColor:(UIColor *)color {
     if (!self.activeColorKey.length) return;
     CFPreferencesSetAppValue((__bridge CFStringRef)self.activeColorKey,
@@ -281,6 +302,7 @@ static void PGWriteValue(NSString *key, id value) {
 - (void)onResetSettings {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
                       @"LandscapeMusic", @"LandscapeMetrics", @"LandscapeMetricsUsage", @"LandscapeCustomBackground", @"LandscapeBackgroundColor",
+                      @"LandscapeAppFilterEnabled", @"LandscapeAppAllowList",
                       @"Disable24H", @"ChargingIcon",
                       @"TwoLine", @"TextColor", @"GrabberStyle", @"FontSize", @"FontStyle",
                       @"EnabledBackgroundColor", @"BackgroundColor",

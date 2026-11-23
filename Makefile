@@ -13,7 +13,7 @@ PerfectGrabber_CFLAGS = -fobjc-arc
 PerfectGrabber_FRAMEWORKS = Foundation UIKit AudioToolbox CoreMotion IOKit
 
 BUNDLE_NAME = PerfectGrabberSettings
-PerfectGrabberSettings_FILES = prefs/PerfectGrabberSettingsController.m
+PerfectGrabberSettings_FILES = prefs/PerfectGrabberSettingsController.m prefs/PGAppSelectionController.m
 PerfectGrabberSettings_INSTALL_PATH = /Library/PreferenceBundles
 PerfectGrabberSettings_FRAMEWORKS = Foundation UIKit
 # -fno-autolink 必须有：#import <Preferences/PSListController.h> 会让 clang modules 自动
