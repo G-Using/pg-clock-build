@@ -165,7 +165,9 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
 @property (nonatomic, strong) NSArray<NSDictionary *> *visibleApps;
 @property (nonatomic, strong) NSMutableSet<NSString *> *selectedIdentifiers;
 @property (nonatomic, copy) NSString *searchText;
-- (void)fillIcons;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, UIImage *> *iconCache;
+@property (nonatomic, strong) NSMutableSet<NSString *> *iconMisses;
+- (UIImage *)iconForBundleIdentifier:(NSString *)bundleIdentifier;
 @end
 
 @implementation PGAppSelectionController
@@ -175,6 +177,8 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
     if (self) {
         _selectedIdentifiers = [NSMutableSet setWithArray:PGReadAllowList()];
         _searchText = @"";
+        _iconCache = [NSMutableDictionary dictionary];
+        _iconMisses = [NSMutableSet set];
     }
     return self;
 }
@@ -213,37 +217,39 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
             if (!strongSelf) return;
             strongSelf.allApps = apps;
             [strongSelf applyFilter];
-            [strongSelf fillIcons];
         });
     });
 }
 
-/// 图标后补：UIApplication 的私有取图接口只能在主线程调，所以后台只出名字和 bundle id，
-/// 列表先能看能用，再回主线程把图标补上。
-- (void)fillIcons {
-    if (self.allApps.count == 0) return;
+/// 图标按行懒加载。UIApplication 的私有取图接口只能在主线程调，而且一次一行
+/// （屏幕里最多十来行）。之前是列表加载完整批取一遍 —— 上百次私有调用堆在主线程上，
+/// 设置 App 直接卡住，这也是这次"打开开关手机就卡住"的帮凶之一。
+- (UIImage *)iconForBundleIdentifier:(NSString *)bundleIdentifier {
+    if (bundleIdentifier.length == 0) return nil;
+
+    UIImage *cached = self.iconCache[bundleIdentifier];
+    if (cached) return cached;
+    if ([self.iconMisses containsObject:bundleIdentifier]) return nil;
 
     SEL iconSelector = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
-    if (![UIApplication.sharedApplication respondsToSelector:iconSelector]) return;
+    if (![UIApplication.sharedApplication respondsToSelector:iconSelector]) return nil;
 
     CGFloat scale = UIScreen.mainScreen.scale > 0.0 ? UIScreen.mainScreen.scale : 3.0;
-    NSMutableArray<NSDictionary *> *updated = [NSMutableArray arrayWithCapacity:self.allApps.count];
-    for (NSDictionary *app in self.allApps) {
-        NSMutableDictionary *entry = [app mutableCopy];
-        if (!entry[PGAppIconKey]) {
-            NSString *bundleIdentifier = entry[PGAppBundleKey];
-            @try {
-                UIImage *icon = ((id (*)(id, SEL, id, NSInteger, CGFloat))objc_msgSend)(
-                    UIApplication.sharedApplication, iconSelector, bundleIdentifier, (NSInteger)0, scale);
-                if ([icon isKindOfClass:[UIImage class]]) entry[PGAppIconKey] = icon;
-            } @catch (NSException *exception) {
-                (void)exception;
-            }
-        }
-        [updated addObject:entry];
+    UIImage *icon = nil;
+    @try {
+        icon = ((id (*)(id, SEL, id, NSInteger, CGFloat))objc_msgSend)(
+            UIApplication.sharedApplication, iconSelector, bundleIdentifier, (NSInteger)0, scale);
+    } @catch (NSException *exception) {
+        (void)exception;
+        icon = nil;
     }
-    self.allApps = updated;
-    [self applyFilter];
+
+    if ([icon isKindOfClass:[UIImage class]]) {
+        self.iconCache[bundleIdentifier] = icon;
+        return icon;
+    }
+    [self.iconMisses addObject:bundleIdentifier];
+    return nil;
 }
 
 - (void)applyFilter {
@@ -314,7 +320,7 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
     NSDictionary *app = self.visibleApps[indexPath.row];
     cell.textLabel.text = app[PGAppNameKey];
     cell.detailTextLabel.text = app[PGAppBundleKey];
-    UIImage *icon = app[PGAppIconKey];
+    UIImage *icon = [self iconForBundleIdentifier:app[PGAppBundleKey]];
     if (icon) {
         cell.imageView.image = icon;
         cell.imageView.layer.cornerRadius = 9.0;

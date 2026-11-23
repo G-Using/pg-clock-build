@@ -882,47 +882,40 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 
 #pragma mark - 当前前台 App
 
-/// 当前前台 App 的 bundle id，250ms 缓存（轮询 250ms 一拍，等于每拍一次）。
+/// 当前前台 App 的 bundle id。
 ///
-/// 三路探针依次尝试，谁先给出非空值就用谁：
-///   1) SpringBoardServices 的 SBSCopyFrontmostApplicationDisplayIdentifier()（dylib 符号，最准）
-///   2) FrontBoardServices 的 display layout（SpringBoard 自己就是靠它知道"屏幕上显示的是谁"）
-///   3) LSApplicationWorkspace.frontmostApplication（老实现，部分系统上恒返回 nil）
+/// ⚠️ 这里必须全程**后台线程**探测。1.1-25 就是在 SpringBoard 主线程上直接调
+/// `SBSCopyFrontmostApplicationDisplayIdentifier()`（同步 XPC）把整台手机锁死的：
+/// 那类"问系统当前前台是谁"的接口会等一个只有 SpringBoard 主线程才能回的答复，
+/// 主线程自己在那儿等 → 直接自锁，连设置里的开关都点不动。
+/// 现在主线程只读缓存，探测全部扔进自己的串行队列。
 ///
-/// 注意：绝不用 SpringBoard 自己的 `SBFrontmostApplicationDisplayIdentifier` —— 那个符号在
-/// dyld 阶段会返回垃圾指针（0x10000003），曾把 SpringBoard 直接带进安全模式。这里是另一个
-/// 东西：SpringBoardServices 这个 dylib 里给插件用的 Copy 函数，进程跑起来之后调用是安全的。
-/// 三路都拿不到就返回 nil，调用方按"放行"处理。
-static NSString *PGFrontmostFromSpringBoardServices(void) {
-    static CFStringRef (*copyFrontmost)(void) = NULL;
-    static BOOL resolved = NO;
+/// 两路探针（都跑在后台队列）：
+///   1) FrontBoardServices 的 display layout —— SpringBoard 自己就是靠它知道"屏幕上显示的是谁"
+///   2) LSApplicationWorkspace.frontmostApplication（老实现，留作兜底）
+/// 都拿不到就返回 nil，调用方按"放行"处理。
+static NSString *const PGFrontmostLockToken = @"PGFrontmostLock";
 
-    if (!resolved) {
-        resolved = YES;
-        void *handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
-                              RTLD_LAZY);
-        if (handle) {
-            copyFrontmost = (CFStringRef (*)(void))dlsym(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");
-        }
-        PGLog(@"白名单探针: SpringBoardServices 前台接口 %@", copyFrontmost ? @"可用" : @"不可用");
-    }
-    if (!copyFrontmost) return nil;
-
-    CFStringRef value = NULL;
-    @try {
-        value = copyFrontmost();
-    } @catch (NSException *exception) {
-        value = NULL;
-    }
-    if (!value) return nil;                       // 桌面上没有 App 在前台
-    if (CFGetTypeID(value) != CFStringGetTypeID()) {
-        CFRelease(value);
-        return nil;
-    }
-    return (__bridge_transfer NSString *)value;   // Copy 函数返回 +1，交给 ARC 接管
+static dispatch_queue_t PGFrontmostQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.netskao.perfectgrabber.frontmost", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
 }
 
-/// 探针 2：只读 currentLayout，不装 transitionHandler —— block 签名对不上会崩。
+static NSString *PGFrontmostCached = nil;
+static CFTimeInterval PGFrontmostCachedAt = 0.0;
+static CFTimeInterval PGFrontmostRequestedAt = 0.0;
+static BOOL PGFrontmostProbing = NO;
+static CFTimeInterval PGFrontmostProbeStartedAt = 0.0;
+/// 探针线程一旦卡死就永久放弃探测（本次 SpringBoard 生命周期内），
+/// 免得每 0.25 秒往同一个堵死的队列里再塞一个 block。
+static BOOL PGFrontmostQueueStuck = NO;
+
+/// 探针 1：FBS display layout。只读 currentLayout，不装 transitionHandler
+/// （block 签名对不上会崩），创建一次后复用。
 static NSString *PGFrontmostFromDisplayLayout(void) {
     static id monitor = nil;
     static BOOL tried = NO;
@@ -996,7 +989,7 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
     return winner;
 }
 
-/// 探针 3：老实现，留作最后兜底。
+/// 探针 2：老实现，留作最后兜底。
 static NSString *PGFrontmostFromWorkspace(void) {
     Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
     if (!workspaceClass) return nil;
@@ -1025,41 +1018,77 @@ static NSString *PGFrontmostFromWorkspace(void) {
     return identifier;
 }
 
-static NSString *PGCurrentFrontmostBundleID(void) {
-    static NSString *cachedIdentifier = nil;
-    static CFTimeInterval cachedAt = 0.0;
-    static NSString *lastSource = nil;
-    static CFTimeInterval lastFailureLog = 0.0;
-
-    CFTimeInterval now = CACurrentMediaTime();
-    if (cachedAt > 0.0 && now - cachedAt < 0.25) return cachedIdentifier;
-
-    cachedAt = now;
-    cachedIdentifier = nil;
-
-    NSString *source = nil;
-    NSString *identifier = PGFrontmostFromSpringBoardServices();
-    if (identifier.length) source = @"SBS";
-    if (identifier.length == 0) {
-        identifier = PGFrontmostFromDisplayLayout();
-        if (identifier.length) source = @"FBS";
-    }
-    if (identifier.length == 0) {
-        identifier = PGFrontmostFromWorkspace();
-        if (identifier.length) source = @"LS";
-    }
-
-    if (identifier.length) {
-        cachedIdentifier = identifier;
-        if (![lastSource isEqualToString:source]) {
-            lastSource = source;
-            PGLog(@"白名单探针: 前台 App=%@（来源 %@）", identifier, source);
+/// 只在探针队列里跑。
+static void PGFrontmostProbeNow(void) {
+    @autoreleasepool {
+        NSString *identifier = PGFrontmostFromDisplayLayout();
+        NSString *source = identifier.length ? @"FBS" : nil;
+        if (identifier.length == 0) {
+            identifier = PGFrontmostFromWorkspace();
+            if (identifier.length) source = @"LS";
         }
-    } else if (now - lastFailureLog > 10.0) {
-        lastFailureLog = now;
-        PGLog(@"白名单探针: 三路都取不到前台 App（SBS/FBS/LS 全空）→ 本次放行");
+
+        static NSString *lastSource = nil;      // 只在探针队列里访问，不用加锁
+        static CFTimeInterval lastFailureLog = 0.0;
+
+        @synchronized (PGFrontmostLockToken) {
+            PGFrontmostCached = identifier;
+            PGFrontmostCachedAt = CACurrentMediaTime();
+            PGFrontmostProbing = NO;
+        }
+
+        CFTimeInterval now = CACurrentMediaTime();
+        if (identifier.length) {
+            if (![lastSource isEqualToString:source]) {
+                lastSource = source;
+                PGLog(@"白名单探针: 前台 App=%@（来源 %@）", identifier, source);
+            }
+        } else if (now - lastFailureLog > 10.0) {
+            lastFailureLog = now;
+            PGLog(@"白名单探针: 两路都取不到前台 App（FBS/LS 全空）→ 本次放行");
+        }
     }
-    return cachedIdentifier;
+}
+
+/// 主线程只读缓存（最多 3 秒旧），顺手触发一次后台探测。
+/// 探测卡住时会一直停在"进行中"，值自然过期 → 返回 nil → 放行，
+/// 绝不会把 SpringBoard 阻塞在这里。
+static NSString *PGCurrentFrontmostBundleID(void) {
+    CFTimeInterval now = CACurrentMediaTime();
+    NSString *value = nil;
+    BOOL needProbe = NO;
+    BOOL justGotStuck = NO;
+
+    @synchronized (PGFrontmostLockToken) {
+        if (PGFrontmostCachedAt > 0.0 && now - PGFrontmostCachedAt < 3.0) {
+            value = PGFrontmostCached;
+        }
+        if (PGFrontmostProbing && PGFrontmostProbeStartedAt > 0.0 &&
+            now - PGFrontmostProbeStartedAt > 2.5) {
+            // 探测超过 2.5 秒没回来：那一路多半是同步 XPC 卡住了。直接放弃探测，
+            // 靠缓存过期走放行分支 —— 优先保证系统不卡。
+            PGFrontmostProbing = NO;
+            PGFrontmostProbeStartedAt = 0.0;
+            PGFrontmostQueueStuck = YES;
+            justGotStuck = YES;
+        }
+        if (!PGFrontmostProbing && !PGFrontmostQueueStuck && now - PGFrontmostRequestedAt > 0.20) {
+            PGFrontmostProbing = YES;
+            PGFrontmostRequestedAt = now;
+            PGFrontmostProbeStartedAt = now;
+            needProbe = YES;
+        }
+    }
+
+    if (justGotStuck) {
+        PGLog(@"白名单探针: 上一次探测超过 2.5s 未返回，本次启动内不再探测（一律放行）");
+    }
+    if (needProbe) {
+        dispatch_async(PGFrontmostQueue(), ^{
+            PGFrontmostProbeNow();
+        });
+    }
+    return value;
 }
 
 #pragma mark - 横屏常驻块
@@ -1174,8 +1203,10 @@ static NSString *PGCurrentFrontmostBundleID(void) {
     self.suspendTimer = nil;
     self.suspended = NO;
 
-    PGLog(@"reload: enabled=%d landscapeAlwaysOn=%d → active=%d",
-          preferences.isEnabled, preferences.landscapeAlwaysOn, self.active);
+    PGLog(@"reload: enabled=%d landscapeAlwaysOn=%d → active=%d（白名单开关=%d 名单=%lu 个）",
+          preferences.isEnabled, preferences.landscapeAlwaysOn, self.active,
+          preferences.landscapeAppFilterEnabled,
+          (unsigned long)preferences.landscapeAppAllowList.count);
 
     if (self.active) {
         PGStartFBSObserver();
