@@ -883,19 +883,121 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 #pragma mark - 当前前台 App
 
 /// 当前前台 App 的 bundle id，250ms 缓存（轮询 250ms 一拍，等于每拍一次）。
-/// 走 LSApplicationWorkspace 的公开私有方法，不用 SBFrontmostApplicationDisplayIdentifier
-/// —— 那个接口在 dyld 阶段返回过垃圾指针，直接把 SpringBoard 带进安全模式。
-/// 取不到就返回 nil，调用方按"放行"处理：宁可多显示，也别让探针失败把功能吞掉。
-static NSString *PGCurrentFrontmostBundleID(void) {
-    static NSString *cachedIdentifier = nil;
-    static CFTimeInterval cachedAt = 0.0;
+///
+/// 三路探针依次尝试，谁先给出非空值就用谁：
+///   1) SpringBoardServices 的 SBSCopyFrontmostApplicationDisplayIdentifier()（dylib 符号，最准）
+///   2) FrontBoardServices 的 display layout（SpringBoard 自己就是靠它知道"屏幕上显示的是谁"）
+///   3) LSApplicationWorkspace.frontmostApplication（老实现，部分系统上恒返回 nil）
+///
+/// 注意：绝不用 SpringBoard 自己的 `SBFrontmostApplicationDisplayIdentifier` —— 那个符号在
+/// dyld 阶段会返回垃圾指针（0x10000003），曾把 SpringBoard 直接带进安全模式。这里是另一个
+/// 东西：SpringBoardServices 这个 dylib 里给插件用的 Copy 函数，进程跑起来之后调用是安全的。
+/// 三路都拿不到就返回 nil，调用方按"放行"处理。
+static NSString *PGFrontmostFromSpringBoardServices(void) {
+    static CFStringRef (*copyFrontmost)(void) = NULL;
+    static BOOL resolved = NO;
 
-    CFTimeInterval now = CACurrentMediaTime();
-    if (cachedAt > 0.0 && now - cachedAt < 0.25) return cachedIdentifier;
+    if (!resolved) {
+        resolved = YES;
+        void *handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                              RTLD_LAZY);
+        if (handle) {
+            copyFrontmost = (CFStringRef (*)(void))dlsym(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");
+        }
+        PGLog(@"白名单探针: SpringBoardServices 前台接口 %@", copyFrontmost ? @"可用" : @"不可用");
+    }
+    if (!copyFrontmost) return nil;
 
-    cachedAt = now;
-    cachedIdentifier = nil;
+    CFStringRef value = NULL;
+    @try {
+        value = copyFrontmost();
+    } @catch (NSException *exception) {
+        value = NULL;
+    }
+    if (!value) return nil;                       // 桌面上没有 App 在前台
+    if (CFGetTypeID(value) != CFStringGetTypeID()) {
+        CFRelease(value);
+        return nil;
+    }
+    return (__bridge_transfer NSString *)value;   // Copy 函数返回 +1，交给 ARC 接管
+}
 
+/// 探针 2：只读 currentLayout，不装 transitionHandler —— block 签名对不上会崩。
+static NSString *PGFrontmostFromDisplayLayout(void) {
+    static id monitor = nil;
+    static BOOL tried = NO;
+
+    if (!tried) {
+        tried = YES;
+        @try {
+            Class configClass = NSClassFromString(@"FBSDisplayLayoutMonitorConfiguration");
+            Class monitorClass = NSClassFromString(@"FBSDisplayLayoutMonitor");
+            if (!configClass || !monitorClass) {
+                dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_LAZY);
+                configClass = NSClassFromString(@"FBSDisplayLayoutMonitorConfiguration");
+                monitorClass = NSClassFromString(@"FBSDisplayLayoutMonitor");
+            }
+            if (configClass && monitorClass) {
+                id config = ((id (*)(id, SEL))objc_msgSend)(
+                    configClass, @selector(configurationForDefaultMainDisplayMonitor));
+                if (config) {
+                    monitor = ((id (*)(id, SEL, id))objc_msgSend)(
+                        monitorClass, @selector(monitorWithConfiguration:), config);
+                }
+            }
+        } @catch (NSException *exception) {
+            monitor = nil;
+        }
+        PGLog(@"白名单探针: FBS 显示布局 %@", monitor ? @"可用" : @"不可用");
+    }
+    if (!monitor) return nil;
+
+    id layout = nil;
+    @try {
+        layout = ((id (*)(id, SEL))objc_msgSend)(monitor, @selector(currentLayout));
+    } @catch (NSException *exception) {
+        layout = nil;
+    }
+    if (!layout) return nil;
+
+    NSArray *elements = nil;
+    @try {
+        id value = ((id (*)(id, SEL))objc_msgSend)(layout, @selector(elements));
+        if ([value isKindOfClass:[NSArray class]]) elements = value;
+    } @catch (NSException *exception) {
+        elements = nil;
+    }
+    if (elements.count == 0) return nil;
+
+    // 层级最高的那个 App 元素就是当前显示的 App。SpringBoard 自己的元素
+    // （bundle id 为 com.apple.springboard）跳过，否则桌面上会把"自己"当前台。
+    NSString *winner = nil;
+    double winnerLevel = -1.0e9;
+    for (id element in elements) {
+        NSString *identifier = nil;
+        double level = 0.0;
+        @try {
+            id value = ((id (*)(id, SEL))objc_msgSend)(element, @selector(bundleIdentifier));
+            if ([value isKindOfClass:[NSString class]]) identifier = value;
+            // level 是 CGFloat 返回值，必须按浮点签名接，用 id 接会读到垃圾寄存器。
+            if ([element respondsToSelector:@selector(level)]) {
+                level = ((double (*)(id, SEL))objc_msgSend)(element, @selector(level));
+            }
+        } @catch (NSException *exception) {
+            continue;
+        }
+        if (identifier.length == 0) continue;
+        if ([identifier isEqualToString:@"com.apple.springboard"]) continue;
+        if (level >= winnerLevel) {
+            winnerLevel = level;
+            winner = identifier;
+        }
+    }
+    return winner;
+}
+
+/// 探针 3：老实现，留作最后兜底。
+static NSString *PGFrontmostFromWorkspace(void) {
     Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
     if (!workspaceClass) return nil;
 
@@ -910,19 +1012,52 @@ static NSString *PGCurrentFrontmostBundleID(void) {
     SEL frontSelector = @selector(frontmostApplication);
     if (![(NSObject *)workspace respondsToSelector:frontSelector]) return nil;
 
-    id application = nil;
+    NSString *identifier = nil;
     @try {
-        application = ((id (*)(id, SEL))objc_msgSend)(workspace, frontSelector);
+        id application = ((id (*)(id, SEL))objc_msgSend)(workspace, frontSelector);
+        if (application) {
+            id value = ((id (*)(id, SEL))objc_msgSend)(application, @selector(bundleIdentifier));
+            if ([value isKindOfClass:[NSString class]]) identifier = value;
+        }
     } @catch (NSException *exception) {
-        application = nil;
+        identifier = nil;
     }
-    if (!application) return nil;
+    return identifier;
+}
 
-    @try {
-        id bundleIdentifier = ((id (*)(id, SEL))objc_msgSend)(application, @selector(bundleIdentifier));
-        if ([bundleIdentifier isKindOfClass:[NSString class]]) cachedIdentifier = bundleIdentifier;
-    } @catch (NSException *exception) {
-        cachedIdentifier = nil;
+static NSString *PGCurrentFrontmostBundleID(void) {
+    static NSString *cachedIdentifier = nil;
+    static CFTimeInterval cachedAt = 0.0;
+    static NSString *lastSource = nil;
+    static CFTimeInterval lastFailureLog = 0.0;
+
+    CFTimeInterval now = CACurrentMediaTime();
+    if (cachedAt > 0.0 && now - cachedAt < 0.25) return cachedIdentifier;
+
+    cachedAt = now;
+    cachedIdentifier = nil;
+
+    NSString *source = nil;
+    NSString *identifier = PGFrontmostFromSpringBoardServices();
+    if (identifier.length) source = @"SBS";
+    if (identifier.length == 0) {
+        identifier = PGFrontmostFromDisplayLayout();
+        if (identifier.length) source = @"FBS";
+    }
+    if (identifier.length == 0) {
+        identifier = PGFrontmostFromWorkspace();
+        if (identifier.length) source = @"LS";
+    }
+
+    if (identifier.length) {
+        cachedIdentifier = identifier;
+        if (![lastSource isEqualToString:source]) {
+            lastSource = source;
+            PGLog(@"白名单探针: 前台 App=%@（来源 %@）", identifier, source);
+        }
+    } else if (now - lastFailureLog > 10.0) {
+        lastFailureLog = now;
+        PGLog(@"白名单探针: 三路都取不到前台 App（SBS/FBS/LS 全空）→ 本次放行");
     }
     return cachedIdentifier;
 }
@@ -1574,8 +1709,12 @@ static NSString *PGCurrentFrontmostBundleID(void) {
     [self teardownWindow];
 }
 
-/// 白名单判定。三种情况直接放行：
-/// 1) 没开过滤；2) 名单为空（等同不过滤）；3) 拿不到前台 App（探针失败）。
+/// 白名单判定。
+/// - 没开过滤 → 全部放行；
+/// - 开了过滤、名单为空 → **全部隐藏**。开关叫"仅指定 App 生效"，名单空着就是谁都不匹配；
+///   以前这里按"不过滤"处理，于是用户打开开关、还没勾任何 App 时，表现和全局生效一模一样
+///   —— 这就是"我没选 App 它也到处都在"的原因。
+/// - 三路探针都拿不到前台 App → 放行。这是探针彻底失败，不能让功能整个消失。
 - (BOOL)isFrontmostAppAllowed {
     PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
     if (!preferences.landscapeAppFilterEnabled) {
@@ -1584,8 +1723,11 @@ static NSString *PGCurrentFrontmostBundleID(void) {
     }
     NSArray<NSString *> *allowList = preferences.landscapeAppAllowList;
     if (allowList.count == 0) {
-        self.lastBlockedApp = nil;
-        return YES;
+        if (![self.lastBlockedApp isEqualToString:@"<empty>"]) {
+            self.lastBlockedApp = @"<empty>";
+            PGLog(@"白名单: 开关已打开但名单为空（0 个 App）→ 全部隐藏");
+        }
+        return NO;
     }
     NSString *frontmost = PGCurrentFrontmostBundleID();
     if (frontmost.length == 0) {

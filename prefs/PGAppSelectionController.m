@@ -51,8 +51,11 @@ static NSArray<NSDictionary *> *PGInstalledUserApplications(void) {
     if (![proxies isKindOfClass:[NSSet class]] && ![proxies isKindOfClass:[NSArray class]]) return @[];
 
     // 图标只在有这个方法时才取（私有 API，个别系统上被移走）。
+    // UIApplication 只允许主线程访问，这段跑在后台队列里 —— 非主线程就跳过取图标，
+    // 列表功能不受影响，总比把设置 App 弄崩好。
     SEL iconSelector = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
-    BOOL canDrawIcon = [UIApplication.sharedApplication respondsToSelector:iconSelector];
+    BOOL canDrawIcon = [NSThread isMainThread] &&
+        [UIApplication.sharedApplication respondsToSelector:iconSelector];
     CGFloat scale = UIScreen.mainScreen.scale > 0.0 ? UIScreen.mainScreen.scale : 3.0;
 
     NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
@@ -104,6 +107,55 @@ static NSArray<NSDictionary *> *PGInstalledUserApplications(void) {
     return result;
 }
 
+/// 兜底枚举：读 MobileInstallation 的 LastLaunchServicesMap.plist。
+/// 设置进程里 LS 数据库偶尔不可用（allInstalledApplications 返回空），列表就成了空的，
+/// 用户根本没法勾 App —— 结果"仅指定 App 生效"等于没配。这份 plist 里有全部 App 的
+/// bundle id 和显示名，mobile 可读，正好兜住这种情况。
+static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
+    NSDictionary *map = [NSDictionary dictionaryWithContentsOfFile:
+                         @"/var/mobile/Library/MobileInstallation/LastLaunchServicesMap.plist"];
+    if (![map isKindOfClass:[NSDictionary class]]) return @[];
+
+    id section = map[@"User"];
+    if (![section isKindOfClass:[NSDictionary class]]) section = map;
+    if (![section isKindOfClass:[NSDictionary class]]) return @[];
+
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+    [(NSDictionary *)section enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+        if (![key isKindOfClass:[NSString class]]) return;
+
+        NSString *bundleIdentifier = key;
+        NSString *name = nil;
+        if ([value isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *info = (NSDictionary *)value;
+            id identifier = info[@"Identifier"];
+            if ([identifier isKindOfClass:[NSString class]] && [identifier length] > 0) {
+                bundleIdentifier = identifier;
+            }
+            for (NSString *nameKey in @[@"CFBundleDisplayName", @"CFBundleName", @"Name", @"DisplayName"]) {
+                id candidate = info[nameKey];
+                if ([candidate isKindOfClass:[NSString class]] && [candidate length] > 0) {
+                    name = candidate;
+                    break;
+                }
+            }
+        }
+        if (bundleIdentifier.length == 0) return;
+        if ([bundleIdentifier hasPrefix:@"com.apple."]) return;      // 系统 App 不要
+        if ([bundleIdentifier hasPrefix:@"com.apple.webapp"]) return;
+
+        [result addObject:@{
+            PGAppNameKey: name.length ? name : bundleIdentifier,
+            PGAppBundleKey: bundleIdentifier
+        }];
+    }];
+
+    [result sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+        return [left[PGAppNameKey] localizedStandardCompare:right[PGAppNameKey]];
+    }];
+    return result;
+}
+
 #pragma mark - 选择页
 
 @interface PGAppSelectionController () <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate>
@@ -113,6 +165,7 @@ static NSArray<NSDictionary *> *PGInstalledUserApplications(void) {
 @property (nonatomic, strong) NSArray<NSDictionary *> *visibleApps;
 @property (nonatomic, strong) NSMutableSet<NSString *> *selectedIdentifiers;
 @property (nonatomic, copy) NSString *searchText;
+- (void)fillIcons;
 @end
 
 @implementation PGAppSelectionController
@@ -154,13 +207,43 @@ static NSArray<NSDictionary *> *PGInstalledUserApplications(void) {
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray<NSDictionary *> *apps = PGInstalledUserApplications();
+        if (apps.count == 0) apps = PGApplicationsFromInstallationMap();   // 设置进程里 LS 不可用时兜底
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
             strongSelf.allApps = apps;
             [strongSelf applyFilter];
+            [strongSelf fillIcons];
         });
     });
+}
+
+/// 图标后补：UIApplication 的私有取图接口只能在主线程调，所以后台只出名字和 bundle id，
+/// 列表先能看能用，再回主线程把图标补上。
+- (void)fillIcons {
+    if (self.allApps.count == 0) return;
+
+    SEL iconSelector = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
+    if (![UIApplication.sharedApplication respondsToSelector:iconSelector]) return;
+
+    CGFloat scale = UIScreen.mainScreen.scale > 0.0 ? UIScreen.mainScreen.scale : 3.0;
+    NSMutableArray<NSDictionary *> *updated = [NSMutableArray arrayWithCapacity:self.allApps.count];
+    for (NSDictionary *app in self.allApps) {
+        NSMutableDictionary *entry = [app mutableCopy];
+        if (!entry[PGAppIconKey]) {
+            NSString *bundleIdentifier = entry[PGAppBundleKey];
+            @try {
+                UIImage *icon = ((id (*)(id, SEL, id, NSInteger, CGFloat))objc_msgSend)(
+                    UIApplication.sharedApplication, iconSelector, bundleIdentifier, (NSInteger)0, scale);
+                if ([icon isKindOfClass:[UIImage class]]) entry[PGAppIconKey] = icon;
+            } @catch (NSException *exception) {
+                (void)exception;
+            }
+        }
+        [updated addObject:entry];
+    }
+    self.allApps = updated;
+    [self applyFilter];
 }
 
 - (void)applyFilter {
