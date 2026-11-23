@@ -1387,8 +1387,14 @@ static BOOL PGFrontmostHasEverResolved(void) {
           CGRectGetWidth(self.window.bounds), CGRectGetHeight(self.window.bounds));
     if (CACurrentMediaTime() < self.suppressTapUntil) return;   // 长按刚开过面板，别被同一串触摸关掉
     if (self.panelVisible) {
-        [self hidePanel];
-        return;
+        if (!self.panel.hidden) {
+            [self hidePanel];      // 面板确实在屏上 → 这一下就是"收起"
+            return;
+        }
+        // 面板已经不可见、状态却还挂着 visible：一旦有这个死状态，之后每次点击都只会
+        // 走到 hidePanel 而什么都看不到 —— 用户眼里就是"怎么点都没反应"。这里自愈。
+        self.panelVisible = NO;
+        PGLog(@"面板: 状态自愈（panelVisible=1 但面板已隐藏）");
     }
     if (![self hasPlayableMedia]) {
         PGLog(@"面板: 没有媒体信息，仍然弹出（内容显示为未在播放）");
