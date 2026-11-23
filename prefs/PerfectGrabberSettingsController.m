@@ -171,7 +171,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"上滑背景颜色" action:@selector(chooseSwipeUpBackgroundColor)]];
 
     PSSpecifier *scope = [PSSpecifier groupSpecifierWithName:@"生效范围"];
-    [scope setProperty:@"打开「仅指定 App 生效」后，只有下面列表里勾选的 App 在横屏时才显示横屏块，其它 App 一律不显示（竖屏本来就不显示）。名单为空＝全部不显示，所以打开开关后请马上在「选择 App…」里勾上要用的 App。勾选后即时生效，不用注销。"
+    [scope setProperty:@"打开「仅指定 App 生效」后，只有下面列表里勾选的 App 在横屏时才显示横屏块，其它 App 一律不显示（竖屏本来就不显示）。桌面和锁屏也一律不显示——iPhone 桌面不支持横屏，但把手机横过来时插件仍会算出横屏，所以这里专门把它们排除掉。名单为空＝全部不显示，所以打开开关后请马上在「选择 App…」里勾上要用的 App。勾选后即时生效，不用注销。"
                 forKey:PSFooterTextGroupKey];
     [items addObject:scope];
     [items addObject:[self preferenceNamed:@"仅指定 App 生效" key:@"LandscapeAppFilterEnabled" defaultValue:@NO cell:PSSwitchCell]];
@@ -197,7 +197,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-26" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-27" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     self.lastLandscapeAppCount = [self selectedLandscapeAppCount];

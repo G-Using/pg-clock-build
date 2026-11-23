@@ -893,7 +893,17 @@ static UIWindowScene *PGLandscapeHostScene(void) {
 /// 两路探针（都跑在后台队列）：
 ///   1) FrontBoardServices 的 display layout —— SpringBoard 自己就是靠它知道"屏幕上显示的是谁"
 ///   2) LSApplicationWorkspace.frontmostApplication（老实现，留作兜底）
-/// 都拿不到就返回 nil，调用方按"放行"处理。
+///
+/// ⚠️ 关键：返回值现在有三种语义，不能再用 "nil = 放行" 糊过去。
+/// iPhone 桌面本身不支持横屏，但用户把手机横过来时重力是横的 —— 插件照样会算出"横屏"。
+/// 1.1-26 之前桌面上布局里没有 App 元素 → 探针返回 nil → 按"探针失败"放行，
+/// 于是**桌面横屏也会显示横屏块**。现在把"最高层是 SpringBoard 自己"明确识别成桌面。
+typedef NS_ENUM(NSInteger, PGFrontmostKind) {
+    PGFrontmostKindUnknown = 0,     ///< 这一拍没拿到任何信息（过渡态 / 探针不可用）
+    PGFrontmostKindApp,             ///< 拿到了某个 App，identifier 有效
+    PGFrontmostKindHomeScreen,      ///< 明确在桌面 / 锁屏 / 通知中心（最高层是 SpringBoard）
+};
+
 static NSString *const PGFrontmostLockToken = @"PGFrontmostLock";
 
 static dispatch_queue_t PGFrontmostQueue(void) {
@@ -906,6 +916,10 @@ static dispatch_queue_t PGFrontmostQueue(void) {
 }
 
 static NSString *PGFrontmostCached = nil;
+static BOOL PGFrontmostCachedHomeScreen = NO;
+/// 本次 SpringBoard 生命周期内是否成功解析过前台身份（App 或桌面）。
+/// 用来区分两种 nil：探针坏了（从未成功）vs. 刚从 App 退回桌面（成功过，只是这一拍没有 App）。
+static BOOL PGFrontmostEverResolved = NO;
 static CFTimeInterval PGFrontmostCachedAt = 0.0;
 static CFTimeInterval PGFrontmostRequestedAt = 0.0;
 static BOOL PGFrontmostProbing = NO;
@@ -916,6 +930,10 @@ static BOOL PGFrontmostQueueStuck = NO;
 
 /// 探针 1：FBS display layout。只读 currentLayout，不装 transitionHandler
 /// （block 签名对不上会崩），创建一次后复用。
+///
+/// 返回**层级最高的那个元素**的 bundle id —— 包括 SpringBoard 自己。
+/// 有 App 在前台时 App 元素的 level 高于 SpringBoard 的桌面元素，赢的是 App；
+/// 回到桌面后 App 元素消失，赢的就是 `com.apple.springboard`，调用方据此判定"在桌面"。
 static NSString *PGFrontmostFromDisplayLayout(void) {
     static id monitor = nil;
     static BOOL tried = NO;
@@ -962,10 +980,9 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
     }
     if (elements.count == 0) return nil;
 
-    // 层级最高的那个 App 元素就是当前显示的 App。SpringBoard 自己的元素
-    // （bundle id 为 com.apple.springboard）跳过，否则桌面上会把"自己"当前台。
     NSString *winner = nil;
     double winnerLevel = -1.0e9;
+    NSUInteger appElementCount = 0;
     for (id element in elements) {
         NSString *identifier = nil;
         double level = 0.0;
@@ -980,11 +997,21 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
             continue;
         }
         if (identifier.length == 0) continue;
-        if ([identifier isEqualToString:@"com.apple.springboard"]) continue;
+        if (![identifier isEqualToString:@"com.apple.springboard"]) appElementCount++;
         if (level >= winnerLevel) {
             winnerLevel = level;
             winner = identifier;
         }
+    }
+
+    // 只在层级归属变化时打一行，方便排查"桌面上为什么还显示"。
+    static NSString *lastWinner = nil;
+    static NSUInteger lastAppCount = NSUIntegerMax;
+    if (![lastWinner isEqualToString:winner] || lastAppCount != appElementCount) {
+        lastWinner = winner;
+        lastAppCount = appElementCount;
+        PGLog(@"白名单探针: 布局最高层=%@ level=%.1f App元素=%lu 个",
+              winner ?: @"(无)", winnerLevel, (unsigned long)appElementCount);
     }
     return winner;
 }
@@ -1023,50 +1050,75 @@ static void PGFrontmostProbeNow(void) {
     @autoreleasepool {
         NSString *identifier = PGFrontmostFromDisplayLayout();
         NSString *source = identifier.length ? @"FBS" : nil;
-        if (identifier.length == 0) {
+
+        // 布局里最顶层是 SpringBoard 自己 → 桌面 / 锁屏 / 通知中心。
+        // 这时候不要再拿 LS 的残留结果去覆盖，否则会把"上一个 App"当现状。
+        BOOL homeScreen = [identifier isEqualToString:@"com.apple.springboard"];
+        if (homeScreen) identifier = nil;
+
+        if (identifier.length == 0 && !homeScreen) {
             identifier = PGFrontmostFromWorkspace();
             if (identifier.length) source = @"LS";
+            // LS 在桌面上也可能直接给 springboard，一并归一成桌面。
+            if ([identifier isEqualToString:@"com.apple.springboard"]) {
+                identifier = nil;
+                homeScreen = YES;
+            }
         }
 
-        static NSString *lastSource = nil;      // 只在探针队列里访问，不用加锁
+        static NSString *lastReported = nil;      // 只在探针队列里访问，不用加锁
         static CFTimeInterval lastFailureLog = 0.0;
 
         @synchronized (PGFrontmostLockToken) {
             PGFrontmostCached = identifier;
+            PGFrontmostCachedHomeScreen = homeScreen;
             PGFrontmostCachedAt = CACurrentMediaTime();
+            if (identifier.length > 0 || homeScreen) PGFrontmostEverResolved = YES;
             PGFrontmostProbing = NO;
         }
 
         CFTimeInterval now = CACurrentMediaTime();
         if (identifier.length) {
-            if (![lastSource isEqualToString:source]) {
-                lastSource = source;
+            if (![lastReported isEqualToString:identifier]) {
+                lastReported = identifier;
                 PGLog(@"白名单探针: 前台 App=%@（来源 %@）", identifier, source);
+            }
+        } else if (homeScreen) {
+            if (![lastReported isEqualToString:@"<home>"]) {
+                lastReported = @"<home>";
+                PGLog(@"白名单探针: 当前在桌面/锁屏（SpringBoard 在最上层）");
             }
         } else if (now - lastFailureLog > 10.0) {
             lastFailureLog = now;
-            PGLog(@"白名单探针: 两路都取不到前台 App（FBS/LS 全空）→ 本次放行");
+            lastReported = nil;
+            PGLog(@"白名单探针: 两路都取不到任何元素（FBS/LS 全空）");
         }
     }
 }
 
 /// 主线程只读缓存（最多 3 秒旧），顺手触发一次后台探测。
-/// 探测卡住时会一直停在"进行中"，值自然过期 → 返回 nil → 放行，
+/// 探测卡住时会一直停在"进行中"，值自然过期 → 返回 Unknown，
 /// 绝不会把 SpringBoard 阻塞在这里。
-static NSString *PGCurrentFrontmostBundleID(void) {
+static PGFrontmostKind PGCurrentFrontmost(NSString **outIdentifier) {
     CFTimeInterval now = CACurrentMediaTime();
     NSString *value = nil;
+    PGFrontmostKind kind = PGFrontmostKindUnknown;
     BOOL needProbe = NO;
     BOOL justGotStuck = NO;
 
     @synchronized (PGFrontmostLockToken) {
         if (PGFrontmostCachedAt > 0.0 && now - PGFrontmostCachedAt < 3.0) {
-            value = PGFrontmostCached;
+            if (PGFrontmostCached.length > 0) {
+                value = PGFrontmostCached;
+                kind = PGFrontmostKindApp;
+            } else if (PGFrontmostCachedHomeScreen) {
+                kind = PGFrontmostKindHomeScreen;
+            }
         }
         if (PGFrontmostProbing && PGFrontmostProbeStartedAt > 0.0 &&
             now - PGFrontmostProbeStartedAt > 2.5) {
             // 探测超过 2.5 秒没回来：那一路多半是同步 XPC 卡住了。直接放弃探测，
-            // 靠缓存过期走放行分支 —— 优先保证系统不卡。
+            // 靠缓存过期走 Unknown 分支 —— 优先保证系统不卡。
             PGFrontmostProbing = NO;
             PGFrontmostProbeStartedAt = 0.0;
             PGFrontmostQueueStuck = YES;
@@ -1088,8 +1140,18 @@ static NSString *PGCurrentFrontmostBundleID(void) {
             PGFrontmostProbeNow();
         });
     }
-    return value;
+    if (outIdentifier) *outIdentifier = value;
+    return kind;
 }
+
+/// 探针是否在本次进程里成功解析过。成功过就说明链路是通的，
+/// 之后的 Unknown 只能解释成"当前没有前台 App"（桌面过渡、锁屏），而不是"探针坏了"。
+static BOOL PGFrontmostHasEverResolved(void) {
+    @synchronized (PGFrontmostLockToken) {
+        return PGFrontmostEverResolved;
+    }
+}
+
 
 #pragma mark - 横屏常驻块
 
@@ -1157,6 +1219,9 @@ static NSString *PGCurrentFrontmostBundleID(void) {
 @property (nonatomic, assign) BOOL musicDesiredVisible;
 /// 上一次因为"不在白名单"被隐藏的 App，用来只打一次日志（每拍都打会刷爆文件）。
 @property (nonatomic, copy, nullable) NSString *lastBlockedApp;
+/// 探针这一拍没拿到前台 App 的起始时刻。用来做 0.45s 的过渡防抖：
+/// 从 App 退回桌面的那几拍会有短暂空窗，立刻收块会闪一下。
+@property (nonatomic, assign) CFTimeInterval frontmostMissingSince;
 
 @end
 
@@ -1644,15 +1709,15 @@ static NSString *PGCurrentFrontmostBundleID(void) {
         return;
     }
 
-    // 白名单：只对指定 App 生效。拿不到前台 App、或名单为空时一律放行 ——
-    // 功能可用性优先，不能因为探针取不到就把用户的横屏块吞掉。
+    // 前台 App 判定：桌面/锁屏一律隐藏；开了"仅指定 App 生效"时再按名单过滤。
+    // 细节见 isFrontmostAppAllowed 的注释。
     if (![self isFrontmostAppAllowed]) {
         self.landscapeSince = 0.0;
         self.portraitSince = 0.0;
         if (self.visible) {
             [self hideBar];
             self.lastHideTime = CACurrentMediaTime();
-            [self logSnapshotShown:NO note:@"app-not-allowed"];
+            [self logSnapshotShown:NO note:@"not-allowed"];
         }
         return;
     }
@@ -1740,18 +1805,72 @@ static NSString *PGCurrentFrontmostBundleID(void) {
     [self teardownWindow];
 }
 
-/// 白名单判定。
-/// - 没开过滤 → 全部放行；
-/// - 开了过滤、名单为空 → **全部隐藏**。开关叫"仅指定 App 生效"，名单空着就是谁都不匹配；
-///   以前这里按"不过滤"处理，于是用户打开开关、还没勾任何 App 时，表现和全局生效一模一样
-///   —— 这就是"我没选 App 它也到处都在"的原因。
-/// - 三路探针都拿不到前台 App → 放行。这是探针彻底失败，不能让功能整个消失。
+/// 白名单判定。返回"这一拍允不允许显示横屏块"。
+///
+/// 顺序很重要：
+/// 1) **桌面 / 锁屏 → 一律隐藏**（不管有没有开过滤）。iPhone 桌面不支持横屏，但把手机
+///    横过来时重力是横的，插件照样会算出"横屏"；以前桌面布局里没有 App 元素 → 探针返回 nil
+///    → 按"探针失败"放行，于是桌面上也冒出横屏块。现在"最高层是 SpringBoard"被明确识别成桌面。
+/// 2) 没开过滤 → 全部放行；
+/// 3) 开了过滤、名单为空 → **全部隐藏**。开关叫"仅指定 App 生效"，名单空着就是谁都不匹配；
+///    以前这里按"不过滤"处理，于是用户打开开关、还没勾任何 App 时，表现和全局生效一模一样。
+/// 4) 探针从未成功过（本次进程内）→ 放行。这是链路彻底不可用，不能让功能整个消失。
 - (BOOL)isFrontmostAppAllowed {
     PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
-    if (!preferences.landscapeAppFilterEnabled) {
+    BOOL filtering = preferences.landscapeAppFilterEnabled;
+
+    NSString *frontmost = nil;
+    PGFrontmostKind kind = PGCurrentFrontmost(&frontmost);
+
+    // ① 桌面 / 锁屏 / 通知中心：这里不存在"横屏内容"，直接不显示。
+    if (kind == PGFrontmostKindHomeScreen) {
+        self.frontmostMissingSince = 0.0;
+        if (![self.lastBlockedApp isEqualToString:@"<home>"]) {
+            self.lastBlockedApp = @"<home>";
+            PGLog(@"前台: 当前在桌面/锁屏 → 隐藏横屏块");
+        }
+        return NO;
+    }
+
+    // 探针链路断过又恢复不了的兜底：从进程启动到现在一次都没成功 → 当成不可用。
+    BOOL everResolved = PGFrontmostHasEverResolved();
+
+    // ② 这一拍没拿到（过渡态）。开了白名单时才升级成"桌面"：
+    //    保持现状 0.45 秒，持续拿不到才隐藏 —— 从 App 退回桌面的那一两拍不会让块闪一下。
+    //    没开白名单时按老逻辑放行，免得探针噪点把全局模式的块吞掉。
+    if (kind == PGFrontmostKindUnknown || frontmost.length == 0) {
+        if (!filtering) {
+            self.frontmostMissingSince = 0.0;
+            self.lastBlockedApp = nil;
+            return YES;
+        }
+        if (!everResolved) {
+            // 真正的不可用：宁可全局显示，也不要把功能整个吞掉。
+            self.lastBlockedApp = @"<probe>";
+            self.frontmostMissingSince = 0.0;
+            return YES;
+        }
+        CFTimeInterval now = CACurrentMediaTime();
+        if (self.frontmostMissingSince <= 0.0) {
+            self.frontmostMissingSince = now;
+            return self.visible;
+        }
+        if (now - self.frontmostMissingSince < 0.45) return self.visible;
+        if (![self.lastBlockedApp isEqualToString:@"<home>"]) {
+            self.lastBlockedApp = @"<home>";
+            PGLog(@"前台: 持续 0.45s 没有前台 App（桌面/锁屏）→ 隐藏横屏块");
+        }
+        return NO;
+    }
+
+    self.frontmostMissingSince = 0.0;
+
+    // ③ 没开过滤 → 全部放行。
+    if (!filtering) {
         self.lastBlockedApp = nil;
         return YES;
     }
+
     NSArray<NSString *> *allowList = preferences.landscapeAppAllowList;
     if (allowList.count == 0) {
         if (![self.lastBlockedApp isEqualToString:@"<empty>"]) {
@@ -1760,11 +1879,8 @@ static NSString *PGCurrentFrontmostBundleID(void) {
         }
         return NO;
     }
-    NSString *frontmost = PGCurrentFrontmostBundleID();
-    if (frontmost.length == 0) {
-        self.lastBlockedApp = nil;
-        return YES;
-    }
+
+    // ④ 名单判定。
     if ([allowList containsObject:frontmost]) {
         self.lastBlockedApp = nil;
         return YES;

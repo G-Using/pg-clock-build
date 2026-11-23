@@ -158,11 +158,16 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
 
 #pragma mark - 选择页
 
+/// 列表按"已启用 / 其他"分成两段，已启用的排在最上面 —— 一眼就知道自己开了哪几个 App。
+static NSString *const PGAppSectionTitleKey = @"title";
+static NSString *const PGAppSectionAppsKey = @"apps";
+
 @interface PGAppSelectionController () <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UISearchBar *searchBar;
 @property (nonatomic, strong) NSArray<NSDictionary *> *allApps;
-@property (nonatomic, strong) NSArray<NSDictionary *> *visibleApps;
+/// 每项：{ title, apps }。已启用段只在本段出现，不重复出现在下面的列表里。
+@property (nonatomic, strong) NSArray<NSDictionary *> *sections;
 @property (nonatomic, strong) NSMutableSet<NSString *> *selectedIdentifiers;
 @property (nonatomic, copy) NSString *searchText;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UIImage *> *iconCache;
@@ -177,6 +182,7 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
     if (self) {
         _selectedIdentifiers = [NSMutableSet setWithArray:PGReadAllowList()];
         _searchText = @"";
+        _sections = @[];
         _iconCache = [NSMutableDictionary dictionary];
         _iconMisses = [NSMutableSet set];
     }
@@ -223,7 +229,7 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
 
 /// 图标按行懒加载。UIApplication 的私有取图接口只能在主线程调，而且一次一行
 /// （屏幕里最多十来行）。之前是列表加载完整批取一遍 —— 上百次私有调用堆在主线程上，
-/// 设置 App 直接卡住，这也是这次"打开开关手机就卡住"的帮凶之一。
+/// 设置 App 直接卡住，这也是"打开开关手机就卡住"的帮凶之一。
 - (UIImage *)iconForBundleIdentifier:(NSString *)bundleIdentifier {
     if (bundleIdentifier.length == 0) return nil;
 
@@ -252,24 +258,63 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
     return nil;
 }
 
+/// 过滤 + 分段。已启用的排第一段，其余排第二段；两段内部都按名字本地化排序。
 - (void)applyFilter {
     NSString *keyword = [self.searchText stringByTrimmingCharactersInSet:
                          [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (keyword.length == 0) {
-        self.visibleApps = self.allApps ?: @[];
-    } else {
-        NSMutableArray *filtered = [NSMutableArray array];
-        for (NSDictionary *app in self.allApps ?: @[]) {
-            NSString *name = app[PGAppNameKey];
-            NSString *bundleID = app[PGAppBundleKey];
-            if ([name rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                [bundleID rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                [filtered addObject:app];
-            }
+
+    NSArray<NSDictionary *> *source = self.allApps ?: @[];
+    NSMutableArray<NSDictionary *> *enabled = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *others = [NSMutableArray array];
+
+    for (NSDictionary *app in source) {
+        NSString *name = app[PGAppNameKey];
+        NSString *bundleID = app[PGAppBundleKey];
+        if (![bundleID isKindOfClass:[NSString class]]) continue;
+
+        if (keyword.length > 0) {
+            BOOL matched = ([name rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+                           ([bundleID rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound);
+            if (!matched) continue;
         }
-        self.visibleApps = filtered;
+        if ([self.selectedIdentifiers containsObject:bundleID]) {
+            [enabled addObject:app];
+        } else {
+            [others addObject:app];
+        }
     }
+
+    NSMutableArray<NSDictionary *> *sections = [NSMutableArray array];
+    if (enabled.count > 0) {
+        [sections addObject:@{
+            PGAppSectionTitleKey: [NSString stringWithFormat:@"已启用（%lu）", (unsigned long)enabled.count],
+            PGAppSectionAppsKey: enabled
+        }];
+    }
+    if (others.count > 0 || sections.count == 0) {
+        [sections addObject:@{
+            PGAppSectionTitleKey: enabled.count > 0 ? @"其他 App" : @"全部 App",
+            PGAppSectionAppsKey: others
+        }];
+    }
+    self.sections = sections;
+
+    // 重排后行数会变（开关一开，那一行就往上跳到"已启用"段），
+    // 顺手把 contentOffset 夹回合法范围，免得列表跳到一半白屏。
+    CGFloat offsetY = self.tableView.contentOffset.y;
     [self.tableView reloadData];
+    CGFloat maxOffsetY = MAX(0.0, self.tableView.contentSize.height - CGRectGetHeight(self.tableView.bounds));
+    if (offsetY > maxOffsetY) {
+        self.tableView.contentOffset = CGPointMake(0.0, maxOffsetY);
+    }
+}
+
+- (NSDictionary *)appAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section >= (NSInteger)self.sections.count) return nil;
+    NSArray *apps = self.sections[indexPath.section][PGAppSectionAppsKey];
+    if (![apps isKindOfClass:[NSArray class]]) return nil;
+    if (indexPath.row >= (NSInteger)apps.count) return nil;
+    return apps[indexPath.row];
 }
 
 #pragma mark 搜索
@@ -289,9 +334,23 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
 
 #pragma mark 列表
 
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    if (self.allApps.count == 0) return 1;   // 一个 App 都没取到：单段一行解释文字
+    return (NSInteger)self.sections.count;
+}
+
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (self.allApps.count == 0) return 1;   // 一个 App 都没取到时给一行解释文字
-    return self.visibleApps.count;
+    if (self.allApps.count == 0) return 1;
+    if (section >= (NSInteger)self.sections.count) return 0;
+    NSArray *apps = self.sections[section][PGAppSectionAppsKey];
+    return [apps isKindOfClass:[NSArray class]] ? (NSInteger)apps.count : 0;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (self.allApps.count == 0) return nil;
+    if (section >= (NSInteger)self.sections.count) return nil;
+    NSString *title = self.sections[section][PGAppSectionTitleKey];
+    return [title isKindOfClass:[NSString class]] ? title : nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -316,8 +375,10 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
         return cell;
     }
 
+    NSDictionary *app = [self appAtIndexPath:indexPath];
+    if (!app) return cell;
+
     cell.accessoryView.hidden = NO;
-    NSDictionary *app = self.visibleApps[indexPath.row];
     cell.textLabel.text = app[PGAppNameKey];
     cell.detailTextLabel.text = app[PGAppBundleKey];
     UIImage *icon = [self iconForBundleIdentifier:app[PGAppBundleKey]];
@@ -353,8 +414,8 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
 }
 
 - (void)commitToggle:(UISwitch *)toggle atIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.row >= (NSInteger)self.visibleApps.count) return;
-    NSString *bundleIdentifier = self.visibleApps[indexPath.row][PGAppBundleKey];
+    NSDictionary *app = [self appAtIndexPath:indexPath];
+    NSString *bundleIdentifier = app[PGAppBundleKey];
     if (![bundleIdentifier isKindOfClass:[NSString class]]) return;
 
     if (toggle.isOn) {
@@ -363,6 +424,14 @@ static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
         [self.selectedIdentifiers removeObject:bundleIdentifier];
     }
     PGWriteAllowList(self.selectedIdentifiers.allObjects);
+
+    // 这一行刚切换完就要在"已启用 / 其他"两段之间搬家。立刻 reloadData 会把开关动画打断，
+    // 所以等 0.28 秒（开关滑完）再重排，视觉上才是"勾完自动飘到上面去"。
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.28 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf applyFilter];
+    });
 }
 
 @end
