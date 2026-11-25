@@ -44,10 +44,19 @@ static void PGWriteValue(NSString *key, id value) {
 - (NSMutableArray *)choiceSpecifiers {
     NSString *key = [self.specifier propertyForKey:PGChoiceKey];
     NSString *title = [self.specifier propertyForKey:PGChoiceTitleKey];
-    NSArray *values = @[@0, @1, @2];
-    NSArray *titles = [key isEqualToString:@"GrabberStyle"]
-        ? @[@"居中", @"靠左", @"靠右"]
-        : @[@"常规", @"粗体", @"斜体"];
+    NSArray *values = nil;
+    NSArray *titles = nil;
+    if ([key isEqualToString:@"LandscapeSnapPosition"]) {
+        values = @[@0, @1, @2, @3, @4, @5, @6, @7];
+        titles = @[@"顶部居中", @"左上角", @"右上角", @"底部居中",
+                   @"左下角", @"右下角", @"左侧居中", @"右侧居中"];
+    } else if ([key isEqualToString:@"GrabberStyle"]) {
+        values = @[@0, @1, @2];
+        titles = @[@"居中", @"靠左", @"靠右"];
+    } else {
+        values = @[@0, @1, @2];
+        titles = @[@"常规", @"粗体", @"斜体"];
+    }
     NSMutableArray *items = [NSMutableArray array];
     [items addObject:[PSSpecifier groupSpecifierWithName:title ?: @""]];
     for (NSUInteger index = 0; index < values.count; index++) {
@@ -181,9 +190,20 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:[self landscapeAppsButtonTitle] action:@selector(chooseLandscapeApps)]];
 
     PSSpecifier *landscape = [PSSpecifier groupSpecifierWithName:@"横屏音乐卡片"];
-    [landscape setProperty:@"横屏时只留这一张卡片。第一行：时间 / 电量（充电带闪电）/ 电池温度 / CPU 占用率；第二行：封面 + 歌名 + 歌手 + 实时歌词（没在放歌也保留封面，文案写「未播放」）。\n\n播放控制默认隐藏：长按整张卡片才展开（上一首 / 播放暂停 / 下一首 + 进度条），松手后 3 秒自动收起，按按钮会重新计时；双指点击也能展开，双指捏合可直接调大小。\n\n整张卡只有一套背景：毛玻璃 + 可调模糊半径 / 不透明度 / 色调。歌词按「歌名 + 歌手 + 时长」联网匹配（网易云，无结果时换 LRCLIB），需要联网；匹配不到显示「暂无歌词」。"
-                    forKey:PSFooterTextGroupKey];
+    [landscape setProperty:@"横屏时只留这一张卡片。平时是收起状态，只有一行：时间 / 电量（充电带闪电）/ 电池温度 / CPU 占用率，外加 ♪ 歌名·歌手 和播放状态（和 1.1 系列的胶囊一样）。\n\n点一下（或长按）才展开：封面 + 歌名 + 歌手 + 实时歌词，下面接播放控制（上一首 / 播放暂停 / 下一首 + 进度条）；3 秒没操作自动收回成状态条，按按钮会重新计时。双指点击也能展开，双指捏合可直接调大小。没在放歌时收起行显示「♪ 未播放」，展开后封面照常显示。\n\n卡片吸附屏幕边缘：先选「吸附位置」，再用「边缘间距」调离边缘留多少空隙（0 = 完全贴边）。\n\n整张卡只有一套背景：毛玻璃 + 可调模糊半径 / 不透明度 / 色调。歌词按「歌名 + 歌手 + 时长」联网匹配（网易云，无结果时换 LRCLIB），需要联网；匹配不到显示「暂无歌词」。"
+                forKey:PSFooterTextGroupKey];
     [items addObject:landscape];
+
+    [items addObject:[self choiceLinkNamed:@"吸附位置" key:@"LandscapeSnapPosition"]];
+
+    PSSpecifier *snapInset = [self preferenceNamed:@"边缘间距" key:@"LandscapeSnapInset"
+                                      defaultValue:@0.0 cell:PSSliderCell];
+    [snapInset setProperty:@0.0 forKey:PSControlMinimumKey];
+    [snapInset setProperty:@40.0 forKey:PSControlMaximumKey];
+    [snapInset setProperty:@YES forKey:@"showValue"];
+    [snapInset setProperty:@"贴边" forKey:@"minLabel"];
+    [snapInset setProperty:@"远" forKey:@"maxLabel"];
+    [items addObject:snapInset];
 
     PSSpecifier *cardSize = [self preferenceNamed:@"卡片大小" key:@"LandscapeCardScale"
                                      defaultValue:@1.35 cell:PSSliderCell];
@@ -216,7 +236,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.2-0" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.3-0" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     self.lastLandscapeAppCount = [self selectedLandscapeAppCount];
@@ -362,6 +382,7 @@ static void PGWriteValue(NSString *key, id value) {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
                       @"LandscapeCardScale", @"LandscapeGlassBlur", @"LandscapeGlassOpacity",
                       @"LandscapeGlassTint", @"LandscapeLyrics",
+                      @"LandscapeSnapPosition", @"LandscapeSnapInset",
                       @"LandscapeAppFilterEnabled", @"LandscapeAppAllowList", @"LandscapePanelScale",
                       @"Disable24H", @"ChargingIcon",
                       @"TwoLine", @"TextColor", @"GrabberStyle", @"FontSize", @"FontStyle",

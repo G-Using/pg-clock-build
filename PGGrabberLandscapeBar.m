@@ -327,10 +327,15 @@ static BOOL PGStartFBSObserver(void) {
 
 /// 设计稿尺寸（1.0 倍）。实际尺寸 = 常量 × LandscapeCardScale（0.7 ~ 2.2，默认 1.35）。
 static const CGFloat PGCardDesignWidth = 320.0;
-/// 控制区收起时的高度。
-static const CGFloat PGCardCollapsedHeight = 96.0;
-/// 控制区展开时的高度。
+/// 收起时的高度：**只留状态行**（时间 / 电量 / 温度 / CPU）。6 + 15 + 6，上下留白对称。
+/// 歌曲区（封面 / 歌名 / 歌词）从 33 才开始排，所以在这个高度下会被 clipsToBounds 整个裁掉 ——
+/// 收起态不需要额外 hidden，改高度就够了。
+static const CGFloat PGCardCollapsedHeight = 27.0;
+/// 展开时的高度：状态行 + 歌曲区 + 控制区。
 static const CGFloat PGCardExpandedHeight = 150.0;
+/// 展开时控制区的起点（歌曲区 33~81 之下）。
+/// ⚠️ 不能再用 PGCardCollapsedHeight 当这个值 —— 收起高度变小之后两者不再相等。
+static const CGFloat PGCardControlsOffset = 86.0;
 static const CGFloat PGCardPadding = 10.0;
 static const CGFloat PGCardArtworkSize = 48.0;
 static const CGFloat PGCardCornerRadius = 18.0;
@@ -376,6 +381,22 @@ static CGFloat PGCardScaleValue(void) {
     return MAX(0.7, MIN(2.2, scale));
 }
 
+/// 吸附位置。0 顶部居中 / 1 左上 / 2 右上 / 3 底部居中 / 4 左下 / 5 右下 /
+/// 6 左侧居中 / 7 右侧居中。默认 0（贴屏幕顶边居中）。
+static NSInteger PGCardSnapPosition(void) {
+    id value = PGCardPreference(@"LandscapeSnapPosition", @0);
+    NSInteger position = [value respondsToSelector:@selector(integerValue)] ? [value integerValue] : 0;
+    return MAX(0, MIN(7, position));
+}
+
+/// 卡片与屏幕边缘之间留多少间隙。0 ~ 40，默认 0 = 完全贴边（就是"吸在最边缘"）。
+static CGFloat PGCardSnapInset(void) {
+    id value = PGCardPreference(@"LandscapeSnapInset", @0.0);
+    double inset = [value respondsToSelector:@selector(doubleValue)] ? [value doubleValue] : 0.0;
+    if (!isfinite(inset) || inset < 0.0) return 0.0;
+    return MIN(40.0, inset);
+}
+
 static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFontWeight weight) {
     if (@available(iOS 13.0, *)) {
         UIImageSymbolConfiguration *configuration =
@@ -408,6 +429,11 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     UILabel *_thermalLabel;
     UILabel *_cpuLabel;
     UIView *_separator;
+    // 收起态还要在这一行里带上播放状态（沿用 1.1 系列胶囊的做法：♪ 歌名 · 歌手 + 播放/暂停图标）。
+    // 展开后这部分让位给下面的歌曲区，藏起来。
+    UIImageView *_musicNoteView;
+    UILabel *_musicLabel;
+    UIImageView *_musicStateView;
 
     // ② 歌曲区
     UIView *_artworkContainer;
@@ -433,6 +459,8 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     NSString *_shownTitle;
     NSString *_shownArtist;
     NSString *_trackKey;
+    /// 收起行播放图标的缓存键（符号 + 倍数），避免每拍重建 SF Symbol。
+    NSString *_musicIconKey;
     NSString *_lyricPrimary;
     NSString *_lyricSecondary;
     NSDateFormatter *_clockFormatter;
@@ -513,12 +541,22 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
         _controlsContainer.hidden = YES;
         _controlsContainer.alpha = 0.0;
         _controlsContainer.userInteractionEnabled = NO;
+        _separator.hidden = YES;
     }
     return self;
 }
 
 - (void)dealloc {
     [_tickTimer invalidate];
+}
+
+/// 收起态只有 30 来点高，横屏打游戏时手指很容易点偏上下边缘。
+/// 命中区上下各放宽 8pt、左右 6pt —— 只影响 hitTest，视觉尺寸不变；
+/// 屏幕最上面那条边在游戏里也没有可点的东西，吃掉它没有代价（和 1.1 的胶囊一致）。
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (CGRectContainsPoint(self.bounds, point)) return YES;
+    if (_controlsVisible) return NO;
+    return CGRectContainsPoint(CGRectInset(self.bounds, -6.0, -8.0), point);
 }
 
 #pragma mark 构造
@@ -573,6 +611,25 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     _separator = [UIView new];
     _separator.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.16];
     [self addSubview:_separator];
+
+    // 收起态的播放状态：♪ + 歌名·歌手 + 播放/暂停图标，挤在温度和执行率之间。
+    _musicNoteView = [UIImageView new];
+    _musicNoteView.image = PGCardSymbol(@"music.note", 8.5, UIFontWeightSemibold);
+    _musicNoteView.tintColor = [UIColor colorWithWhite:1.0 alpha:0.80];
+    _musicNoteView.contentMode = UIViewContentModeScaleAspectFit;
+    [self addSubview:_musicNoteView];
+
+    _musicLabel = [UILabel new];
+    _musicLabel.font = [UIFont systemFontOfSize:10.0 weight:UIFontWeightMedium];
+    _musicLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.90];
+    _musicLabel.numberOfLines = 1;
+    _musicLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self addSubview:_musicLabel];
+
+    _musicStateView = [UIImageView new];
+    _musicStateView.tintColor = [UIColor colorWithWhite:1.0 alpha:0.85];
+    _musicStateView.contentMode = UIViewContentModeScaleAspectFit;
+    [self addSubview:_musicStateView];
 }
 
 - (void)buildSongSection {
@@ -715,6 +772,8 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     BOOL playingChanged = (playing != _playing);
     _playing = playing;
     if (playingChanged) [self updateToggleSymbol];
+    // 收起态那一行也要跟着更新（歌名 / 播放状态都在这条线上）。
+    [self refreshStatusMusicRow];
 
     // 换曲：请求歌词。同一首反复调用是空操作，provider 自己会去重。
     NSString *trackKey = [NSString stringWithFormat:@"%@|%@", title ?: @"", artist ?: @""];
@@ -761,6 +820,35 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     CGFloat textScale = _appliedTextScale > 0.0 ? _appliedTextScale : 1.0;
     UIImage *image = PGCardSymbol(_playing ? @"pause.fill" : @"play.fill", 13.0 * textScale, UIFontWeightBold);
     [_toggleButton setImage:image forState:UIControlStateNormal];
+}
+
+/// 收起态那一行里的播放状态：♪ 歌名 · 歌手 + 播放/暂停图标（和 1.1 系列的胶囊一致）。
+/// 展开后歌曲区已经把这些信息铺开了，这一小段就让位。
+- (void)refreshStatusMusicRow {
+    NSString *text = nil;
+    if (!_hasMedia) {
+        text = @"未播放";
+    } else if (_shownTitle.length && _shownArtist.length) {
+        text = [NSString stringWithFormat:@"%@ · %@", _shownTitle, _shownArtist];
+    } else if (_shownTitle.length) {
+        text = _shownTitle;
+    } else {
+        text = _shownArtist ?: @"未播放";
+    }
+    if (![text isEqualToString:(_musicLabel.text ?: @"")]) {
+        _musicLabel.text = text;
+        [self setNeedsLayout];
+    }
+
+    // 图标只在"符号或缩放倍数变了"时重建，这方法每 0.25 秒会被叫一次。
+    CGFloat textScale = _appliedTextScale > 0.0 ? _appliedTextScale : 1.0;
+    NSString *symbol = _hasMedia ? (_playing ? @"pause.fill" : @"play.fill") : nil;
+    _musicStateView.hidden = (symbol == nil);
+    NSString *key = [NSString stringWithFormat:@"%@/%.2f", symbol ?: @"-", textScale];
+    if (![key isEqualToString:(_musicIconKey ?: @"")]) {
+        _musicIconKey = key;
+        _musicStateView.image = symbol ? PGCardSymbol(symbol, 8.5 * textScale, UIFontWeightBold) : nil;
+    }
 }
 
 - (double)displayedElapsed {
@@ -993,6 +1081,10 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     if (_controlsVisible == visible) return;
     _controlsVisible = visible;
     _controlsContainer.userInteractionEnabled = visible;
+    // 收起态的卡片只有状态行那么高，分隔线正好压在底边上（看起来像一条脏边）→ 收起时直接藏掉。
+    _separator.hidden = !visible;
+    // 状态行里的播放状态只在收起态显示（展开后由下面的歌曲区承担），需要重排一次。
+    [self setNeedsLayout];
 
     if (visible) {
         _controlsContainer.hidden = NO;
@@ -1031,7 +1123,9 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
 
 /// 点按落点判定：点在封面上且确实在放歌 → 跳回播放器（返回 YES，调用方不再处理）。
 /// 卡片是普通视图，手势统一在宿主 PGLandscapeBar 里，所以这里只做几何判断。
+/// 收起态整张卡只有状态行，封面根本不可见 —— 这时候点哪儿都应该是"展开"，不能吃掉这次点按。
 - (BOOL)handleTapAtPoint:(CGPoint)point {
+    if (!_controlsVisible) return NO;
     if (!_canOpenApp) return NO;
     if (!CGRectContainsPoint(_artworkContainer.frame, point)) return NO;
     if (self.onOpenApplication) self.onOpenApplication();
@@ -1192,9 +1286,9 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     _lyricLabel.frame = CGRectMake(textX, artY + 27.0 * s, textWidth, 27.0 * s);
 
     // ③ 播放控制区（高度由宿主的卡片尺寸决定，这里只排内部）
-    CGFloat collapsed = PGCardCollapsedHeight * s;
-    _controlsContainer.frame = CGRectMake(0.0, collapsed, width,
-                                          MAX(0.0, height - collapsed));
+    CGFloat controlsTop = PGCardControlsOffset * s;
+    _controlsContainer.frame = CGRectMake(0.0, controlsTop, width,
+                                          MAX(0.0, height - controlsTop));
     CGFloat innerWidth = MAX(0.0, width - 2.0 * pad);
     _progressTrack.frame = CGRectMake(pad, 4.0 * s, innerWidth, 3.0 * s);
     _progressTrack.layer.cornerRadius = 1.5 * s;
@@ -1253,10 +1347,51 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
 
     CGSize thermalSize = [_thermalLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)];
     _thermalLabel.frame = CGRectMake(x, y, ceil(thermalSize.width) + 1.0, h);
+    x = CGRectGetMaxX(_thermalLabel.frame);
 
+    // 执行率先排（右对齐），中间剩下的宽度全部留给播放状态。
     CGSize cpuSize = [_cpuLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)];
     CGFloat cpuWidth = MIN(ceil(cpuSize.width) + 1.0, MAX(0.0, right - pad));
     _cpuLabel.frame = CGRectMake(right - cpuWidth, y, cpuWidth, h);
+
+    // 播放状态：♪ + 歌名·歌手 + 播放/暂停图标。展开后歌曲区已经铺开这些信息，这一小段藏掉。
+    BOOL showMusic = (!_controlsVisible && _musicLabel.text.length > 0);
+    if (!showMusic) {
+        _musicNoteView.hidden = YES;
+        _musicLabel.hidden = YES;
+        _musicNoteView.frame = CGRectZero;
+        _musicLabel.frame = CGRectZero;
+        _musicStateView.frame = CGRectZero;
+        return;
+    }
+
+    CGFloat musicLeft = x + 9.0 * s;
+    CGFloat musicRight = CGRectGetMinX(_cpuLabel.frame) - 9.0 * s;
+    CGFloat noteWidth = 9.0 * s;
+    CGFloat stateWidth = 9.0 * s;
+    CGFloat spacing = 3.0 * s;
+    // 窄到放不下图标 + 一个字符就整段不画，别把执行率挤出去。
+    if (musicRight - musicLeft < noteWidth + stateWidth + spacing * 2.0 + 8.0 * s) {
+        _musicNoteView.hidden = YES;
+        _musicLabel.hidden = YES;
+        _musicStateView.hidden = YES;
+        _musicNoteView.frame = CGRectZero;
+        _musicLabel.frame = CGRectZero;
+        _musicStateView.frame = CGRectZero;
+        return;
+    }
+
+    _musicNoteView.hidden = NO;
+    _musicLabel.hidden = NO;
+
+    CGFloat iconHeight = 10.0 * s;
+    _musicNoteView.frame = CGRectMake(musicLeft, y + (h - iconHeight) / 2.0, noteWidth, iconHeight);
+    CGFloat stateX = musicRight - stateWidth;
+    _musicStateView.frame = CGRectMake(stateX, y + (h - iconHeight) / 2.0, stateWidth, iconHeight);
+
+    CGFloat labelX = musicLeft + noteWidth + spacing;
+    CGFloat labelRight = _musicStateView.hidden ? musicRight : (stateX - spacing);
+    _musicLabel.frame = CGRectMake(labelX, y, MAX(0.0, labelRight - labelX), h);
 }
 
 - (void)applyScale:(CGFloat)scale textScale:(CGFloat)textScale {
@@ -1271,6 +1406,10 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     _batteryLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 * textScale weight:UIFontWeightMedium];
     _thermalLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 * textScale weight:UIFontWeightMedium];
     _cpuLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 * textScale weight:UIFontWeightMedium];
+    _musicLabel.font = [UIFont systemFontOfSize:10.0 * textScale weight:UIFontWeightMedium];
+    _musicNoteView.image = PGCardSymbol(@"music.note", 8.5 * textScale, UIFontWeightSemibold);
+    // 倍数变了图标要按新字号重画：清掉缓存键，下一拍 refreshStatusMusicRow 会重建。
+    _musicIconKey = nil;
 
     _titleLabel.font = [UIFont systemFontOfSize:12.5 * textScale weight:UIFontWeightSemibold];
     _artistLabel.font = [UIFont systemFontOfSize:10.0 * textScale weight:UIFontWeightRegular];
@@ -1359,14 +1498,36 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
 @end
 
 /// 承载窗口所在场景。
+///
+/// ⚠️ 必须优先挑 **ForegroundActive** 那个。以前是"第一个不是 Unattached 的就用"，
+/// 于是切过别的 App 再回来时，很容易挑到留在后台的旧场景 —— 窗口挂上去以后
+/// `hidden = NO` 也不会渲染，表现就是"回到游戏，卡片再也不出来了"。
 static UIWindowScene *PGLandscapeHostScene(void) {
     UIApplication *application = UIApplication.sharedApplication;
+    UIWindowScene *active = nil;
+    UIWindowScene *inactive = nil;
+    UIWindowScene *background = nil;
     for (UIScene *scene in application.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
         UIWindowScene *windowScene = (UIWindowScene *)scene;
-        if (windowScene.activationState == UISceneActivationStateUnattached) continue;
-        return windowScene;
+        switch (windowScene.activationState) {
+            case UISceneActivationStateForegroundActive:
+                if (!active) active = windowScene;
+                break;
+            case UISceneActivationStateForegroundInactive:
+                if (!inactive) inactive = windowScene;
+                break;
+            case UISceneActivationStateBackground:
+                if (!background) background = windowScene;
+                break;
+            default:
+                break;
+        }
     }
+    if (active) return active;
+    if (inactive) return inactive;
+    if (background) return background;
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     for (UIWindow *window in application.windows) {
@@ -1741,6 +1902,8 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 @property (nonatomic, assign) CFTimeInterval suppressTapUntil;
 /// 上次重建窗口的时间，用于给重建限流。
 @property (nonatomic, assign) CFTimeInterval lastWindowRebuild;
+/// 窗口挂错场景的起始时刻（0 = 当前没问题）。确认 0.8 秒才真的重建。
+@property (nonatomic, assign) CFTimeInterval sceneMismatchSince;
 /// 显示/隐藏抖动检测：窗口期内翻转次数，以及熔断到期时间。
 @property (nonatomic, assign) NSInteger toggleBurst;
 @property (nonatomic, assign) CFTimeInterval burstWindowStart;
@@ -1877,14 +2040,23 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
     }
 }
 
-/// 单指点卡片：展开状态下收回控制区；收起状态下什么都不做（避免误触把卡片弄没）。
+/// 单指点卡片：收起态 → 展开（点击就够，不必长按）；展开态 → 点封面跳播放器，其余位置收回。
 - (void)handleCardTap:(UITapGestureRecognizer *)recognizer {
     if (CACurrentMediaTime() < self.suppressTapUntil) return;
     if (!self.card) return;
-    // 点在封面上 = 跳回播放器；其它位置：展开状态下收回控制区，收起状态下什么都不做。
+
+    if (!self.controlsVisible) {
+        // 收起态整张卡只有状态行（时间 / 电量 / 温度 / CPU）。单击一下才把歌曲区和播放控制拉出来。
+        [self showControls];
+        // 给了展开动作就要给收起动作：3 秒不动自动回到状态行。
+        [self scheduleControlsHide];
+        return;
+    }
+
+    // 点在封面上 = 跳回播放器；其它位置 = 收回。
     CGPoint point = [recognizer locationInView:self.card];
     if ([self.card handleTapAtPoint:point]) return;
-    if (self.controlsVisible) [self hideControls];
+    [self hideControls];
 }
 
 /// 双指点击：横屏双手握持时食指常压在卡片附近，双指点比长按更省事。
@@ -2336,14 +2508,40 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 - (void)ensureWindowAttached {
     if (!self.window) return;
     UIWindowScene *scene = self.window.windowScene;
-    if (scene && scene.activationState != UISceneActivationStateUnattached) return;
-    // 一个可用场景都拿不到（多见于切前台 / 返回桌面的动画中间），先别拆，等下一次轮询。
-    if (!PGLandscapeHostScene()) return;
-    // 重建本身也会闪一下，限流：1.5 秒内最多一次。
+    UIWindowScene *best = PGLandscapeHostScene();
+
+    // ① 窗口已经脱场景（场景 nil / unattached）：必须重建，只 hidden = NO 是亮不出来的。
+    if (!scene || scene.activationState == UISceneActivationStateUnattached) {
+        if (!best) return;   // 一个场景都拿不到（切前台动画中），等下一拍
+        [self rebuildWindowForReason:@"窗口已脱离场景" scene:scene];
+        return;
+    }
+
+    // ② 窗口挂在一个"不是当前前台活跃"的场景上 —— 退桌面、开别的 App、再回游戏时最常见。
+    //    这种窗口 hidden 设成 NO 也不会渲染，表现就是"回到游戏，卡片再也不出来了"。
+    //    先确认 0.8 秒再动，避免旋转 / 切前台瞬间场景列表抖动导致反复重建。
+    BOOL wrongScene = (best && best != scene &&
+                       scene.activationState != UISceneActivationStateForegroundActive);
+    if (!wrongScene) {
+        self.sceneMismatchSince = 0.0;
+        return;
+    }
+    CFTimeInterval now = CACurrentMediaTime();
+    if (self.sceneMismatchSince <= 0.0) {
+        self.sceneMismatchSince = now;
+        return;
+    }
+    if (now - self.sceneMismatchSince < 0.8) return;
+    [self rebuildWindowForReason:@"窗口所挂场景已不是前台活跃场景" scene:scene];
+}
+
+/// 拆掉窗口等下一拍重建（限流 1.5 秒，重建本身也会闪一下）。
+- (void)rebuildWindowForReason:(NSString *)reason scene:(UIWindowScene *)scene {
     CFTimeInterval now = CACurrentMediaTime();
     if (self.lastWindowRebuild > 0.0 && now - self.lastWindowRebuild < 1.5) return;
     self.lastWindowRebuild = now;
-    PGLog(@"窗口场景失效(scene=%@ state=%ld)，重建窗口",
+    self.sceneMismatchSince = 0.0;
+    PGLog(@"窗口重建（%@）：scene=%@ state=%ld", reason,
           scene ? @"有" : @"无", (long)(scene ? scene.activationState : -1));
     [self teardownWindow];
 }
@@ -2483,6 +2681,16 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 #pragma mark 显示
 
 - (void)showCardLeftEdgeUp:(BOOL)leftEdgeUp {
+    // 长时间隐藏之后再出现（退桌面 / 切别的 App / 回游戏）：直接把窗口拆了重来。
+    // 旧窗口可能挂在一个已失效或已退到后台的场景上，也可能成了孤儿 ——
+    // 这几种情况 window.hidden = NO 都不会把它画出来。重建一次最省心，代价只有几毫秒。
+    CFTimeInterval now = CACurrentMediaTime();
+    if (!self.visible && self.lastHideTime > 0.0 && now - self.lastHideTime > 2.5) {
+        PGLog(@"卡片重现：已隐藏 %.1fs → 重建窗口", now - self.lastHideTime);
+        [self teardownWindow];
+        self.lastHideTime = 0.0;
+    }
+
     if (![self ensureWindowAndSubviews]) return;
     if (!self.updating) {
         [self.card startTicking];
@@ -2491,9 +2699,11 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
     self.anchorLeftEdgeUp = leftEdgeUp;
     [self layoutCardLeftEdgeUp:leftEdgeUp];
     self.window.hidden = NO;
+    // 无条件放出来：以前只在"从隐藏变显示"那一刻设一次，万一中途有别的地方把 card.hidden
+    // 置成 YES（重建 / 回收），visible 还是 YES 就再也不会修回来 —— 表现同样是"卡片不见了"。
+    self.card.hidden = NO;
 
     if (!self.visible) {
-        self.card.hidden = NO;
         // 只有"第一次出现"或"确实藏了一会儿"才淡入。若是在几百毫秒内又显回来，
         // 再来一次淡入就是肉眼可见的闪 —— 直接给满透明度。
         BOOL longGap = !self.appearedOnce ||
@@ -2511,13 +2721,22 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
             [self.card.layer removeAllAnimations];
             self.card.alpha = 1.0;
         }
+    } else if (self.card.alpha < 0.5) {
+        // visible 已经是 YES 但透明度还被上一次淡入动画 / 中途打断留在半路：补一次。
+        [self.card.layer removeAllAnimations];
+        self.card.alpha = 1.0;
     }
     self.lastShowTime = CACurrentMediaTime();
     self.visible = YES;
 }
 
 - (BOOL)ensureWindowAndSubviews {
-    if (self.window) return YES;
+    if (self.window) {
+        // 窗口还在、但卡片已经不在视图树里（系统回收 / 场景重建的残留）：一样按"没有"处理。
+        if (self.card && self.card.superview) return YES;
+        PGLog(@"窗口在但卡片已脱离视图树 → 整体重建");
+        [self teardownWindow];
+    }
 
     // 只用来做一次合法性检查；实际排版尺寸一律读 window.bounds（横竖屏由系统改写）。
     CGRect base = UIScreen.mainScreen.bounds;
@@ -2637,8 +2856,8 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
     return CGSizeMake(ceil(width), ceil(width * ratio));
 }
 
-/// 只做几何摆放：横屏空间贴顶边居中；万一窗口仍是竖屏基准，就贴"物理朝上"的那条长边并旋转 90°。
-/// 两种分支在同一物理姿态下看起来是同一个位置，所以旋转过程中切换分支不会跳。
+/// 只做几何摆放：按「吸附位置」贴到屏幕边缘；万一窗口仍是竖屏基准，就贴"物理朝上"的
+/// 那条长边并旋转 90°。两种分支在同一物理姿态下看起来是同一个位置，所以旋转过程中切换分支不会跳。
 - (void)placeCardInBounds:(CGRect)space {
     if (!self.card) return;
     CGFloat spaceWidth = CGRectGetWidth(space);
@@ -2649,15 +2868,30 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
     self.cardLength = size.width;
     self.cardThickness = size.height;
 
-    CGFloat inset = PGLandscapeBarEdgeInset;
+    // 0 顶部居中 / 1 左上 / 2 右上 / 3 底部居中 / 4 左下 / 5 右下 / 6 左侧居中 / 7 右侧居中
+    NSInteger snap = PGCardSnapPosition();
+    CGFloat inset = PGCardSnapInset();
+    BOOL alignLeft = (snap == 1 || snap == 4 || snap == 6);
+    BOOL alignRight = (snap == 2 || snap == 5 || snap == 7);
+    BOOL alignTop = (snap == 0 || snap == 1 || snap == 2);
+    BOOL alignBottom = (snap == 3 || snap == 4 || snap == 5);
+
     self.card.transform = CGAffineTransformIdentity;
     self.card.bounds = CGRectMake(0.0, 0.0, size.width, size.height);
 
     if (spaceWidth > spaceHeight) {
-        // 横屏坐标系：y=0 那条边就是用户视角的顶边，卡片贴顶居中，展开时往下长。
-        self.card.center = CGPointMake(spaceWidth / 2.0, inset + size.height / 2.0);
+        // 横屏坐标系：y=0 那条边就是用户视角的顶边。贴顶时展开往下长，贴底时往上长 ——
+        // 这里只算 center，height 变化时被吸附的那条边自然钉住。
+        CGFloat x = alignLeft ? inset
+                  : alignRight ? (spaceWidth - inset - size.width)
+                  : (spaceWidth - size.width) / 2.0;
+        CGFloat y = alignTop ? inset
+                  : alignBottom ? (spaceHeight - inset - size.height)
+                  : (spaceHeight - size.height) / 2.0;
+        self.card.center = CGPointMake(x + size.width / 2.0, y + size.height / 2.0);
     } else {
         // 竖屏坐标系（旋转未能同步到这里时）：用户视角的顶边是左右两条长边，卡片旋转 90° 贴上去。
+        // 这一支只在方向同步失败时才会走到，沿长边方向一律居中 —— 免得和上面那支来回跳。
         BOOL leftSide = self.anchorLeftEdgeUp;
         CGFloat centerX = leftSide ? (inset + size.height / 2.0)
                                    : (spaceWidth - inset - size.height / 2.0);
@@ -2667,6 +2901,7 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 }
 
 - (void)hideBar {
+    BOOL wasVisible = self.visible;
     if (self.updating) {
         [self.card stopTicking];
         self.updating = NO;
@@ -2681,6 +2916,9 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
     self.visible = NO;
     self.landscapeSince = 0.0;
     self.portraitSince = 0.0;
+    // 只记"真的从显示变成隐藏"那一次。inactive / suspended 每拍都会调到这里，
+    // 若无条件刷新，重新启用时永远算不出"藏了多久"，那条重建窗口的兜底就失效了。
+    if (wasVisible) self.lastHideTime = CACurrentMediaTime();
 }
 
 - (void)teardownWindow {
