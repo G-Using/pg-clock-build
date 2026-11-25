@@ -5,10 +5,11 @@ static NSString *const PGAppDomain = @"com.netskao.perfectgrabber";
 static NSString *const PGAppAllowListKey = @"LandscapeAppAllowList";
 static NSString *const PGAppChangedNotification = @"com.netskao.perfectgrabber.settingschanged";
 
-/// 每个 App 存一条：name / bundleID / icon。
+/// 每个 App 存一条：name / bundleID / path / iconPath。
 static NSString *const PGAppNameKey = @"name";
 static NSString *const PGAppBundleKey = @"bundleID";
-static NSString *const PGAppIconKey = @"icon";
+static NSString *const PGAppPathKey = @"path";
+static NSString *const PGAppIconPathKey = @"iconPath";
 
 #pragma mark - 偏好读写
 
@@ -32,128 +33,408 @@ static void PGWriteAllowList(NSArray<NSString *> *list) {
 
 #pragma mark - 已安装 App 枚举
 
-/// LSApplicationWorkspace / LSApplicationProxy 都是私有类，设置进程（Preferences）里需要在运行时
-/// 动态取。任何一步拿不到就返回空数组 —— 列表空着总比设置页直接崩好。
-static NSArray<NSDictionary *> *PGInstalledUserApplications(void) {
-    Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
-    if (!workspaceClass) return @[];
+/// ⚠️ 1.1-30 的关键修复：TrollStore（巨魔）装的 App 在设置列表里"找不到"。
+///
+/// 原因有三个，全都出在老实现上：
+///   ① 只查了 LSApplicationWorkspace 的 allInstalledApplications。巨魔绕过了 installd，
+///      只把 App 塞进 LS 的某几个索引里，很多机型上这个接口直接看不到它们；
+///      （巨魔自己的安装记录在 MobileInstallation 里也没有，所以老代码那条 plist 兜底同样兜不住。）
+///   ② 老代码 `if (!name.length) continue;` —— 巨魔 App 的 localizedName 有时返回空
+///      （InfoPlist.strings 缺失 / ldid 伪签名后 LS 不解析本地化），整条被丢掉，名字都没有。
+///   ③ 老代码要求 applicationType == "User"，巨魔装的会被标成 Internal，一样被筛掉。
+///
+/// 现在改成"多路合并、任一命中就收"：LS 三个接口 + 扫 App 目录 + MobileInstallation 记录。
+static NSString *const PGSystemAppPrefix = @"com.apple.";
 
-    id workspace = ((id (*)(id, SEL))objc_msgSend)(workspaceClass, @selector(defaultWorkspace));
-    if (!workspace) return @[];
-
-    NSSet *proxies = nil;
-    @try {
-        proxies = ((id (*)(id, SEL))objc_msgSend)(workspace, @selector(allInstalledApplications));
-    } @catch (NSException *exception) {
-        NSLog(@"[PerfectGrabber] allInstalledApplications 抛异常: %@", exception);
-        return @[];
-    }
-    if (![proxies isKindOfClass:[NSSet class]] && ![proxies isKindOfClass:[NSArray class]]) return @[];
-
-    // 图标只在有这个方法时才取（私有 API，个别系统上被移走）。
-    // UIApplication 只允许主线程访问，这段跑在后台队列里 —— 非主线程就跳过取图标，
-    // 列表功能不受影响，总比把设置 App 弄崩好。
-    SEL iconSelector = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
-    BOOL canDrawIcon = [NSThread isMainThread] &&
-        [UIApplication.sharedApplication respondsToSelector:iconSelector];
-    CGFloat scale = UIScreen.mainScreen.scale > 0.0 ? UIScreen.mainScreen.scale : 3.0;
-
-    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
-    for (id proxy in proxies) {
-        NSString *bundleIdentifier = nil;
-        NSString *name = nil;
-        NSString *type = nil;
-        @try {
-            bundleIdentifier = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(bundleIdentifier));
-            name = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(localizedName));
-            type = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(applicationType));
-        } @catch (NSException *exception) {
-            continue;
-        }
-        if (![bundleIdentifier isKindOfClass:[NSString class]] || bundleIdentifier.length == 0) continue;
-        if (![name isKindOfClass:[NSString class]] || name.length == 0) continue;
-
-        // 只要用户装的 App：applicationType 为 "User"；取不到类型时退化成"不是 com.apple.*"。
-        BOOL userApp = [type isKindOfClass:[NSString class]]
-            ? [type isEqualToString:@"User"]
-            : ![bundleIdentifier hasPrefix:@"com.apple."];
-        // Web App / 输入法等也会出现在列表里，但它们没有可横屏的界面，直接跳过。
-        if (!userApp) continue;
-        if ([bundleIdentifier hasPrefix:@"com.apple.webapp"]) continue;
-
-        UIImage *icon = nil;
-        if (canDrawIcon) {
-            @try {
-                icon = ((id (*)(id, SEL, id, NSInteger, CGFloat))objc_msgSend)(UIApplication.sharedApplication,
-                                                                              iconSelector,
-                                                                              bundleIdentifier,
-                                                                              (NSInteger)0,
-                                                                              scale);
-            } @catch (NSException *exception) {
-                icon = nil;
-            }
-        }
-
-        NSMutableDictionary *entry = [NSMutableDictionary dictionary];
-        entry[PGAppNameKey] = name;
-        entry[PGAppBundleKey] = bundleIdentifier;
-        if ([icon isKindOfClass:[UIImage class]]) entry[PGAppIconKey] = icon;
-        [result addObject:entry];
-    }
-
-    [result sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
-        return [left[PGAppNameKey] localizedStandardCompare:right[PGAppNameKey]];
-    }];
-    return result;
+static BOOL PGBundleIdentifierIsIgnored(NSString *bundleIdentifier) {
+    if (![bundleIdentifier isKindOfClass:[NSString class]]) return YES;
+    if (bundleIdentifier.length == 0) return YES;
+    if ([bundleIdentifier hasPrefix:PGSystemAppPrefix]) return YES;   // 系统 App / Web App
+    return NO;
 }
 
-/// 兜底枚举：读 MobileInstallation 的 LastLaunchServicesMap.plist。
-/// 设置进程里 LS 数据库偶尔不可用（allInstalledApplications 返回空），列表就成了空的，
-/// 用户根本没法勾 App —— 结果"仅指定 App 生效"等于没配。这份 plist 里有全部 App 的
-/// bundle id 和显示名，mobile 可读，正好兜住这种情况。
-static NSArray<NSDictionary *> *PGApplicationsFromInstallationMap(void) {
+/// 字典里按 key 取字符串，类型不对就当没有 —— 私有对象吐出来的东西一律不信。
+static NSString *PGEntryString(NSDictionary *entry, NSString *key) {
+    if (![entry isKindOfClass:[NSDictionary class]]) return nil;
+    id value = entry[key];
+    return [value isKindOfClass:[NSString class]] ? value : nil;
+}
+
+static NSString *PGDisplayNameFromInfoPlist(NSDictionary *info, NSString *fallback) {
+    if ([info isKindOfClass:[NSDictionary class]]) {
+        for (NSString *key in @[@"CFBundleDisplayName", @"CFBundleName", @"CFBundleExecutable"]) {
+            id value = info[key];
+            if ([value isKindOfClass:[NSString class]] && [value length] > 0) return value;
+        }
+    }
+    return [fallback isKindOfClass:[NSString class]] ? fallback : nil;
+}
+
+/// 从 Info.plist 的图标声明里收集候选文件名（新式 CFBundleIcons + 老式 CFBundleIconFiles）。
+static void PGCollectIconNames(NSDictionary *icons, NSMutableArray<NSString *> *names) {
+    if (![icons isKindOfClass:[NSDictionary class]]) return;
+
+    id primary = icons[@"CFBundlePrimaryIcon"];
+    if ([primary isKindOfClass:[NSDictionary class]]) {
+        id files = ((NSDictionary *)primary)[@"CFBundleIconFiles"];
+        if ([files isKindOfClass:[NSArray class]]) [names addObjectsFromArray:files];
+        id iconName = ((NSDictionary *)primary)[@"CFBundleIconName"];
+        if ([iconName isKindOfClass:[NSString class]]) [names addObject:iconName];
+    }
+}
+
+/// 在 .app 包里找一张能用的大图标。巨魔装的 App 走不通私有取图接口时全靠这条路。
+static NSString *PGIconPathForAppBundle(NSString *appPath, NSDictionary *info) {
+    if (![appPath isKindOfClass:[NSString class]] || appPath.length == 0) return nil;
+
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    PGCollectIconNames(info[@"CFBundleIcons"], names);
+    PGCollectIconNames(info[@"CFBundleIcons~ipad"], names);
+    id legacy = info[@"CFBundleIconFiles"];
+    if ([legacy isKindOfClass:[NSArray class]]) [names addObjectsFromArray:legacy];
+    id legacyIpad = info[@"CFBundleIconFiles~ipad"];
+    if ([legacyIpad isKindOfClass:[NSArray class]]) [names addObjectsFromArray:legacyIpad];
+    id iconFile = info[@"CFBundleIconFile"];
+    if ([iconFile isKindOfClass:[NSString class]]) [names addObject:iconFile];
+
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSArray<NSString *> *suffixes = @[@"@3x~iphone.png", @"@3x.png", @"@2x~iphone.png",
+                                      @"@2x.png", @"~iphone.png", @".png"];
+    // 数组末尾通常是最大尺寸那一张，倒着找。
+    for (NSString *name in [names reverseObjectEnumerator]) {
+        if (![name isKindOfClass:[NSString class]] || name.length == 0) continue;
+        NSString *base = [name stringByDeletingPathExtension];
+        for (NSString *suffix in suffixes) {
+            NSString *candidate = [appPath stringByAppendingPathComponent:
+                                   [base stringByAppendingString:suffix]];
+            if ([fileManager fileExistsAtPath:candidate]) return candidate;
+        }
+        NSString *direct = [appPath stringByAppendingPathComponent:name];   // 文件名可能已带扩展名
+        if ([fileManager fileExistsAtPath:direct]) return direct;
+    }
+
+    // 最后一招：扫目录里所有 icon 类 PNG，挑体积最大的（≈分辨率最高）。
+    NSArray<NSString *> *entries = [fileManager contentsOfDirectoryAtPath:appPath error:NULL];
+    NSString *best = nil;
+    unsigned long long bestSize = 0;
+    for (NSString *entry in entries) {
+        if (![entry.pathExtension.lowercaseString isEqualToString:@"png"]) continue;
+        if ([entry rangeOfString:@"icon" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+        NSString *full = [appPath stringByAppendingPathComponent:entry];
+        NSDictionary *attributes = [fileManager attributesOfItemAtPath:full error:NULL];
+        unsigned long long size = [attributes[NSFileSize] unsignedLongLongValue];
+        if (size > bestSize) {
+            bestSize = size;
+            best = full;
+        }
+    }
+    return best;
+}
+
+/// 同一条 App 可能被好几路同时看到，这里做合并：名字取第一个"像样"的，路径/图标路径缺了才补。
+static void PGMergeAppEntry(NSMutableDictionary<NSString *, NSMutableDictionary *> *collector,
+                            NSString *bundleIdentifier,
+                            NSString *name,
+                            NSString *appPath,
+                            NSString *iconPath) {
+    if (PGBundleIdentifierIsIgnored(bundleIdentifier)) return;
+
+    NSMutableDictionary *entry = collector[bundleIdentifier];
+    if (!entry) {
+        entry = [NSMutableDictionary dictionary];
+        entry[PGAppBundleKey] = bundleIdentifier;
+        entry[PGAppNameKey] = @"";
+        collector[bundleIdentifier] = entry;
+    }
+
+    NSString *currentName = PGEntryString(entry, PGAppNameKey);
+    BOOL hasGoodName = currentName.length > 0 && ![currentName isEqualToString:bundleIdentifier];
+    if (!hasGoodName && [name isKindOfClass:[NSString class]] && name.length > 0) {
+        entry[PGAppNameKey] = name;
+    }
+
+    NSString *currentPath = PGEntryString(entry, PGAppPathKey);
+    if (currentPath.length == 0 && [appPath isKindOfClass:[NSString class]] && appPath.length > 0) {
+        entry[PGAppPathKey] = appPath;
+    }
+    NSString *currentIcon = PGEntryString(entry, PGAppIconPathKey);
+    if (currentIcon.length == 0 && [iconPath isKindOfClass:[NSString class]] && iconPath.length > 0) {
+        entry[PGAppIconPathKey] = iconPath;
+    }
+}
+
+/// ① LaunchServices：三个接口全试一遍。正常从 App Store / 侧载装的 App 都在这；
+/// 巨魔装的有一部分机型能在这里出现（在 Internal 那一类），有一部分完全看不到。
+static void PGCollectFromWorkspace(NSMutableDictionary<NSString *, NSMutableDictionary *> *collector) {
+    Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
+    if (!workspaceClass) return;
+
+    id workspace = ((id (*)(id, SEL))objc_msgSend)(workspaceClass, @selector(defaultWorkspace));
+    if (!workspace) return;
+
+    NSMutableArray *batches = [NSMutableArray array];
+    @try {
+        id installed = ((id (*)(id, SEL))objc_msgSend)(workspace, @selector(allInstalledApplications));
+        if (installed) [batches addObject:installed];
+    } @catch (NSException *exception) {
+        NSLog(@"[PerfectGrabber] allInstalledApplications 抛异常: %@", exception);
+    }
+    @try {
+        id all = ((id (*)(id, SEL))objc_msgSend)(workspace, @selector(allApplications));
+        if (all) [batches addObject:all];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+
+    SEL enumerateSelector = @selector(enumerateApplicationsOfType:block:);
+    if ([workspace respondsToSelector:enumerateSelector]) {
+        // 0 = User，2 = Internal。巨魔装的 App 在部分系统版本上被归到 Internal。
+        for (NSNumber *typeBox in @[@0, @2]) {
+            NSMutableArray *collected = [NSMutableArray array];
+            @try {
+                ((void (*)(id, SEL, NSUInteger, id))objc_msgSend)(
+                    workspace, enumerateSelector, (NSUInteger)typeBox.unsignedIntegerValue,
+                    ^(id proxy) {
+                        if (proxy) [collected addObject:proxy];
+                    });
+            } @catch (NSException *exception) {
+                (void)exception;
+            }
+            if (collected.count > 0) [batches addObject:collected];
+        }
+    }
+
+    for (id batch in batches) {
+        if (![batch respondsToSelector:@selector(count)]) continue;
+        for (id proxy in batch) {
+            NSString *bundleIdentifier = nil;
+            NSString *name = nil;
+            NSURL *bundleURL = nil;
+            @try {
+                bundleIdentifier = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(bundleIdentifier));
+                name = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(localizedName));
+                bundleURL = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(bundleURL));
+            } @catch (NSException *exception) {
+                continue;
+            }
+            if (PGBundleIdentifierIsIgnored(bundleIdentifier)) continue;
+            if (![bundleURL isKindOfClass:[NSURL class]]) bundleURL = nil;
+            if (![name isKindOfClass:[NSString class]]) name = nil;
+
+            NSString *appPath = bundleURL.path;
+            if (name.length == 0 && appPath.length > 0) {
+                // 巨魔 App 的 localizedName 常为空，直接翻它自己的 Info.plist。
+                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                                      [appPath stringByAppendingPathComponent:@"Info.plist"]];
+                name = PGDisplayNameFromInfoPlist(info, [appPath.lastPathComponent stringByDeletingPathExtension]);
+            }
+            PGMergeAppEntry(collector, bundleIdentifier, name, appPath, nil);
+        }
+    }
+}
+
+/// 扫一个目录下的 .app。depth 控制往下钻几层（巨魔的路径是 <UUID>/<Name>.app，两层够）。
+static void PGScanAppDirectory(NSString *root,
+                               NSInteger depth,
+                               NSMutableDictionary<NSString *, NSMutableDictionary *> *collector) {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSArray<NSString *> *entries = [fileManager contentsOfDirectoryAtPath:root error:NULL];
+    if (entries.count == 0) return;
+
+    for (NSString *entry in entries) {
+        if ([entry hasPrefix:@"."]) continue;
+        NSString *fullPath = [root stringByAppendingPathComponent:entry];
+
+        BOOL isDirectory = NO;
+        if (![fileManager fileExistsAtPath:fullPath isDirectory:&isDirectory] || !isDirectory) continue;
+
+        if ([entry hasSuffix:@".app"]) {
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                                  [fullPath stringByAppendingPathComponent:@"Info.plist"]];
+            if (![info isKindOfClass:[NSDictionary class]]) continue;
+
+            // 扩展（.appex）也长在 .app 里，它的 Info.plist 带 NSExtension，不是能启动的 App。
+            if (info[@"NSExtension"] != nil) continue;
+            id packageType = info[@"CFBundlePackageType"];
+            if ([packageType isKindOfClass:[NSString class]] && ![packageType isEqualToString:@"APPL"]) continue;
+
+            NSString *bundleIdentifier = info[@"CFBundleIdentifier"];
+            if (PGBundleIdentifierIsIgnored(bundleIdentifier)) continue;
+
+            NSString *fallbackName = [entry stringByDeletingPathExtension];
+            NSString *name = PGDisplayNameFromInfoPlist(info, fallbackName);
+            NSString *iconPath = PGIconPathForAppBundle(fullPath, info);
+            PGMergeAppEntry(collector, bundleIdentifier, name, fullPath, iconPath);
+            continue;   // 不再往 .app 里钻
+        }
+
+        if (depth > 0) PGScanAppDirectory(fullPath, depth - 1, collector);
+    }
+}
+
+/// ② 文件系统：巨魔装在这里（/var/containers/Bundle/Application/<UUID>/<Name>.app）。
+/// 越狱商店装的 App 通常在 /Applications。rootless 环境还有 /var/jb/Applications。
+static void PGCollectFromBundleDirectories(NSMutableDictionary<NSString *, NSMutableDictionary *> *collector) {
+    NSArray<NSString *> *roots = @[
+        @"/var/containers/Bundle/Application",
+        @"/var/mobile/Containers/Bundle/Application",   // 和上面是同一目录（软链），加着防路径差异
+        @"/Applications",
+        @"/var/jb/Applications",
+    ];
+
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSMutableSet<NSString *> *visited = [NSMutableSet set];
+    for (NSString *root in roots) {
+        NSString *resolved = [root stringByResolvingSymlinksInPath] ?: root;
+        if ([visited containsObject:resolved]) continue;   // 软链指向同一目录，别扫两遍
+        [visited addObject:resolved];
+
+        BOOL isDirectory = NO;
+        if (![fileManager fileExistsAtPath:root isDirectory:&isDirectory] || !isDirectory) continue;
+        PGScanAppDirectory(root, 2, collector);
+    }
+}
+
+/// ③ MobileInstallation 的 LastLaunchServicesMap.plist：LS 数据库不可用时的兜底。
+/// 注意巨魔 App 不在这里（它不走 installd），所以这条路只是补充，不是主力。
+static void PGCollectFromInstallationMap(NSMutableDictionary<NSString *, NSMutableDictionary *> *collector) {
     NSDictionary *map = [NSDictionary dictionaryWithContentsOfFile:
                          @"/var/mobile/Library/MobileInstallation/LastLaunchServicesMap.plist"];
-    if (![map isKindOfClass:[NSDictionary class]]) return @[];
+    if (![map isKindOfClass:[NSDictionary class]]) return;
 
     id section = map[@"User"];
     if (![section isKindOfClass:[NSDictionary class]]) section = map;
-    if (![section isKindOfClass:[NSDictionary class]]) return @[];
+    if (![section isKindOfClass:[NSDictionary class]]) return;
 
-    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
     [(NSDictionary *)section enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
         if (![key isKindOfClass:[NSString class]]) return;
 
         NSString *bundleIdentifier = key;
         NSString *name = nil;
+        NSString *path = nil;
         if ([value isKindOfClass:[NSDictionary class]]) {
             NSDictionary *info = (NSDictionary *)value;
             id identifier = info[@"Identifier"];
             if ([identifier isKindOfClass:[NSString class]] && [identifier length] > 0) {
                 bundleIdentifier = identifier;
             }
-            for (NSString *nameKey in @[@"CFBundleDisplayName", @"CFBundleName", @"Name", @"DisplayName"]) {
-                id candidate = info[nameKey];
-                if ([candidate isKindOfClass:[NSString class]] && [candidate length] > 0) {
-                    name = candidate;
-                    break;
+            name = PGDisplayNameFromInfoPlist(info, nil);
+            id bundlePath = info[@"Path"];
+            if ([bundlePath isKindOfClass:[NSString class]] && [bundlePath length] > 0) path = bundlePath;
+        }
+        if (PGBundleIdentifierIsIgnored(bundleIdentifier)) return;
+        PGMergeAppEntry(collector, bundleIdentifier, name, path, nil);
+    }];
+}
+
+/// 三路合并后统一排序（按显示名，取不到名字就用 bundle id 兜底）。
+static NSArray<NSDictionary *> *PGInstalledApplications(void) {
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *collector = [NSMutableDictionary dictionary];
+    PGCollectFromWorkspace(collector);
+    PGCollectFromBundleDirectories(collector);
+    PGCollectFromInstallationMap(collector);
+
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray arrayWithCapacity:collector.count];
+    for (NSMutableDictionary *entry in collector.allValues) {
+        NSString *name = PGEntryString(entry, PGAppNameKey);
+        if (name.length == 0) entry[PGAppNameKey] = entry[PGAppBundleKey];   // 名字实在没有就用 bundle id
+        [result addObject:entry];
+    }
+
+    [result sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+        NSString *leftName = PGEntryString(left, PGAppNameKey) ?: @"";
+        NSString *rightName = PGEntryString(right, PGAppNameKey) ?: @"";
+        return [leftName localizedStandardCompare:rightName];
+    }];
+    return result;
+}
+
+/// 少数条目（LS 里只有注册记录、bundleURL 为空）拿不到路径，用 proxy 再问一次。
+/// 只在真的缺路径时才调，拿到就写回 entry，不会每行都查。
+static NSString *PGAppPathForBundleIdentifier(NSString *bundleIdentifier) {
+    Class proxyClass = NSClassFromString(@"LSApplicationProxy");
+    if (!proxyClass || ![proxyClass respondsToSelector:@selector(applicationProxyForIdentifier:)]) return nil;
+
+    NSString *path = nil;
+    @try {
+        id proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxyClass,
+                                                       @selector(applicationProxyForIdentifier:),
+                                                       bundleIdentifier);
+        if (proxy) {
+            NSURL *url = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(bundleURL));
+            if ([url isKindOfClass:[NSURL class]]) path = url.path;
+        }
+    } @catch (NSException *exception) {
+        (void)exception;
+        path = nil;
+    }
+    return path;
+}
+
+/// 直接把 .app 当 bundle，从它的 Assets.car 里取 AppIcon。
+/// 设置进程里 UIApplication 的私有取图接口经常直接返回 nil（截图里那种"只有名字没图标"），
+/// 但 App 自己的 bundle 是本地文件，imageNamed:inBundle: 一定能读到，普通 App 和巨魔 App 通吃。
+static UIImage *PGIconFromAppBundle(NSString *appPath, NSDictionary *info) {
+    if (![appPath isKindOfClass:[NSString class]] || appPath.length == 0) return nil;
+
+    NSBundle *bundle = [NSBundle bundleWithPath:appPath];
+    if (!bundle) return nil;
+
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    // Info.plist 里的 CFBundleIconName 就是 asset 里的名字（新式 App 基本都是 "AppIcon"）。
+    if ([info isKindOfClass:[NSDictionary class]]) {
+        id icons = info[@"CFBundleIcons"];
+        if ([icons isKindOfClass:[NSDictionary class]]) {
+            id primary = ((NSDictionary *)icons)[@"CFBundlePrimaryIcon"];
+            if ([primary isKindOfClass:[NSDictionary class]]) {
+                id iconName = ((NSDictionary *)primary)[@"CFBundleIconName"];
+                if ([iconName isKindOfClass:[NSString class]] && [iconName length] > 0) {
+                    [candidates addObject:iconName];
                 }
             }
         }
-        if (bundleIdentifier.length == 0) return;
-        if ([bundleIdentifier hasPrefix:@"com.apple."]) return;      // 系统 App 不要
-        if ([bundleIdentifier hasPrefix:@"com.apple.webapp"]) return;
+    }
+    [candidates addObjectsFromArray:@[@"AppIcon60x60", @"AppIcon", @"AppIcon-60", @"Icon-60", @"Icon"]];
 
-        [result addObject:@{
-            PGAppNameKey: name.length ? name : bundleIdentifier,
-            PGAppBundleKey: bundleIdentifier
-        }];
-    }];
+    for (NSString *name in candidates) {
+        UIImage *image = nil;
+        @try {
+            image = [UIImage imageNamed:name inBundle:bundle compatibleWithTraitCollection:nil];
+        } @catch (NSException *exception) {
+            (void)exception;
+            image = nil;
+        }
+        if ([image isKindOfClass:[UIImage class]]) return image;
+    }
+    return nil;
+}
 
-    [result sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
-        return [left[PGAppNameKey] localizedStandardCompare:right[PGAppNameKey]];
+/// 统一重绘成 40pt 的正方形（保持比例居中）。
+/// 必须重绘：直接 imageWithContentsOfFile: 读 1024×1024 的 AppIcon，
+/// size 会是 1024pt，塞进 52pt 的行里直接溢出屏；而且一张解码就是 4MB。
+static UIImage *PGIconThumbnail(UIImage *icon) {
+    if (![icon isKindOfClass:[UIImage class]]) return nil;
+
+    CGFloat scale = UIScreen.mainScreen.scale > 0.0 ? UIScreen.mainScreen.scale : 3.0;
+    CGFloat side = 40.0;
+
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.scale = scale;
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side)
+                                                                             format:format];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        CGSize imageSize = icon.size;
+        if (imageSize.width <= 0.0 || imageSize.height <= 0.0) {
+            [icon drawInRect:CGRectMake(0.0, 0.0, side, side)];
+            return;
+        }
+        CGFloat ratio = MIN(side / imageSize.width, side / imageSize.height);
+        CGSize drawSize = CGSizeMake(imageSize.width * ratio, imageSize.height * ratio);
+        [icon drawInRect:CGRectMake((side - drawSize.width) / 2.0,
+                                    (side - drawSize.height) / 2.0,
+                                    drawSize.width, drawSize.height)];
     }];
-    return result;
 }
 
 #pragma mark - 选择页
@@ -172,7 +453,7 @@ static NSString *const PGAppSectionAppsKey = @"apps";
 @property (nonatomic, copy) NSString *searchText;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UIImage *> *iconCache;
 @property (nonatomic, strong) NSMutableSet<NSString *> *iconMisses;
-- (UIImage *)iconForBundleIdentifier:(NSString *)bundleIdentifier;
+- (UIImage *)iconForApp:(NSDictionary *)app;
 @end
 
 @implementation PGAppSelectionController
@@ -213,11 +494,10 @@ static NSString *const PGAppSectionAppsKey = @"apps";
     _tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     [self.view addSubview:_tableView];
 
-    // 枚举几十上百个 App 要读 LS 数据库，别卡住第一帧。
+    // 枚举 App 要读 LS 数据库 + 扫一遍 App 目录，别卡住第一帧。
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSArray<NSDictionary *> *apps = PGInstalledUserApplications();
-        if (apps.count == 0) apps = PGApplicationsFromInstallationMap();   // 设置进程里 LS 不可用时兜底
+        NSArray<NSDictionary *> *apps = PGInstalledApplications();
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
@@ -227,32 +507,66 @@ static NSString *const PGAppSectionAppsKey = @"apps";
     });
 }
 
-/// 图标按行懒加载。UIApplication 的私有取图接口只能在主线程调，而且一次一行
-/// （屏幕里最多十来行）。之前是列表加载完整批取一遍 —— 上百次私有调用堆在主线程上，
-/// 设置 App 直接卡住，这也是"打开开关手机就卡住"的帮凶之一。
-- (UIImage *)iconForBundleIdentifier:(NSString *)bundleIdentifier {
+/// 图标按行懒加载。之前是整个列表加载完就一次性批量取图 —— 上百次私有调用堆在主线程上，
+/// 设置 App 直接卡住。现在只给屏幕里那几行取，取过就进缓存。
+- (UIImage *)iconForApp:(NSDictionary *)app {
+    NSString *bundleIdentifier = PGEntryString(app, PGAppBundleKey);
     if (bundleIdentifier.length == 0) return nil;
 
     UIImage *cached = self.iconCache[bundleIdentifier];
     if (cached) return cached;
     if ([self.iconMisses containsObject:bundleIdentifier]) return nil;
 
-    SEL iconSelector = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
-    if (![UIApplication.sharedApplication respondsToSelector:iconSelector]) return nil;
-
-    CGFloat scale = UIScreen.mainScreen.scale > 0.0 ? UIScreen.mainScreen.scale : 3.0;
     UIImage *icon = nil;
-    @try {
-        icon = ((id (*)(id, SEL, id, NSInteger, CGFloat))objc_msgSend)(
-            UIApplication.sharedApplication, iconSelector, bundleIdentifier, (NSInteger)0, scale);
-    } @catch (NSException *exception) {
-        (void)exception;
-        icon = nil;
+
+    // ① 系统私有接口：能出图就最快（无 IO）。
+    SEL iconSelector = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
+    if ([UIApplication.sharedApplication respondsToSelector:iconSelector]) {
+        CGFloat scale = UIScreen.mainScreen.scale > 0.0 ? UIScreen.mainScreen.scale : 3.0;
+        @try {
+            icon = ((id (*)(id, SEL, id, NSInteger, CGFloat))objc_msgSend)(
+                UIApplication.sharedApplication, iconSelector, bundleIdentifier, (NSInteger)0, scale);
+        } @catch (NSException *exception) {
+            (void)exception;
+            icon = nil;
+        }
+    }
+    if (![icon isKindOfClass:[UIImage class]]) icon = nil;
+
+    // ② 取不到（设置进程里这个私有接口常年返回 nil）：直接进 .app 的 bundle，
+    //    从 Assets.car 里按 AppIcon 取。这条路对普通 App 和巨魔 App 都成立。
+    NSString *appPath = PGEntryString(app, PGAppPathKey);
+    if (appPath.length == 0) {
+        appPath = PGAppPathForBundleIdentifier(bundleIdentifier);
+        if (appPath.length > 0 && [app isKindOfClass:[NSMutableDictionary class]]) {
+            ((NSMutableDictionary *)app)[PGAppPathKey] = appPath;
+        }
+    }
+    if (!icon && appPath.length > 0) {
+        icon = PGIconFromAppBundle(appPath, nil);
     }
 
-    if ([icon isKindOfClass:[UIImage class]]) {
-        self.iconCache[bundleIdentifier] = icon;
-        return icon;
+    // ③ 包里没有 Assets.car（老 App 用散装 PNG）：用枚举时算好的图标文件路径直接读。
+    if (!icon) {
+        NSString *iconPath = PGEntryString(app, PGAppIconPathKey);
+        if (iconPath.length == 0 && appPath.length > 0) {
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                                  [appPath stringByAppendingPathComponent:@"Info.plist"]];
+            iconPath = PGIconPathForAppBundle(appPath, info);
+            if (iconPath.length > 0 && [app isKindOfClass:[NSMutableDictionary class]]) {
+                ((NSMutableDictionary *)app)[PGAppIconPathKey] = iconPath;
+            }
+        }
+        if (iconPath.length > 0) {
+            icon = [UIImage imageWithContentsOfFile:iconPath];
+            if (![icon isKindOfClass:[UIImage class]]) icon = nil;
+        }
+    }
+
+    if (icon) {
+        UIImage *thumbnail = PGIconThumbnail(icon) ?: icon;
+        self.iconCache[bundleIdentifier] = thumbnail;
+        return thumbnail;
     }
     [self.iconMisses addObject:bundleIdentifier];
     return nil;
@@ -268,8 +582,8 @@ static NSString *const PGAppSectionAppsKey = @"apps";
     NSMutableArray<NSDictionary *> *others = [NSMutableArray array];
 
     for (NSDictionary *app in source) {
-        NSString *name = app[PGAppNameKey];
-        NSString *bundleID = app[PGAppBundleKey];
+        NSString *name = PGEntryString(app, PGAppNameKey) ?: @"";
+        NSString *bundleID = PGEntryString(app, PGAppBundleKey);
         if (![bundleID isKindOfClass:[NSString class]]) continue;
 
         if (keyword.length > 0) {
@@ -369,7 +683,7 @@ static NSString *const PGAppSectionAppsKey = @"apps";
 
     if (self.allApps.count == 0) {
         cell.textLabel.text = @"没读到已安装的 App";
-        cell.detailTextLabel.text = @"请退出设置重新进一次";
+        cell.detailTextLabel.text = @"退出设置再进一次试试";
         cell.imageView.image = nil;
         cell.accessoryView.hidden = YES;
         return cell;
@@ -379,11 +693,12 @@ static NSString *const PGAppSectionAppsKey = @"apps";
     if (!app) return cell;
 
     cell.accessoryView.hidden = NO;
-    cell.textLabel.text = app[PGAppNameKey];
-    cell.detailTextLabel.text = app[PGAppBundleKey];
-    UIImage *icon = [self iconForBundleIdentifier:app[PGAppBundleKey]];
+    cell.textLabel.text = PGEntryString(app, PGAppNameKey) ?: @"";
+    cell.detailTextLabel.text = PGEntryString(app, PGAppBundleKey) ?: @"";
+    UIImage *icon = [self iconForApp:app];
     if (icon) {
         cell.imageView.image = icon;
+        cell.imageView.contentMode = UIViewContentModeScaleAspectFit;
         cell.imageView.layer.cornerRadius = 9.0;
         cell.imageView.layer.cornerCurve = kCACornerCurveContinuous;
         cell.imageView.clipsToBounds = YES;
@@ -415,7 +730,7 @@ static NSString *const PGAppSectionAppsKey = @"apps";
 
 - (void)commitToggle:(UISwitch *)toggle atIndexPath:(NSIndexPath *)indexPath {
     NSDictionary *app = [self appAtIndexPath:indexPath];
-    NSString *bundleIdentifier = app[PGAppBundleKey];
+    NSString *bundleIdentifier = PGEntryString(app, PGAppBundleKey);
     if (![bundleIdentifier isKindOfClass:[NSString class]]) return;
 
     if (toggle.isOn) {

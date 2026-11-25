@@ -12,6 +12,7 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
 @property (nonatomic, readwrite) BOOL landscapeMetrics;
 @property (nonatomic, readwrite) BOOL landscapeMetricsUsage;
 @property (nonatomic, readwrite) BOOL landscapeAppFilterEnabled;
+@property (nonatomic, readwrite) CGFloat landscapePanelScale;
 @property (nonatomic, copy, readwrite) NSArray<NSString *> *landscapeAppAllowList;
 @property (nonatomic, readwrite) BOOL landscapeCustomBackground;
 @property (nonatomic, readwrite) UIColor *landscapeBackgroundColor;
@@ -92,6 +93,10 @@ NSString *const PGPreferencesChangedNotification = @"com.netskao.perfectgrabber.
     self.landscapeMetrics = [[self valueForKey:@"LandscapeMetrics" fallback:@YES] boolValue];
     self.landscapeMetricsUsage = [[self valueForKey:@"LandscapeMetricsUsage" fallback:@YES] boolValue];
     self.landscapeAppFilterEnabled = [[self valueForKey:@"LandscapeAppFilterEnabled" fallback:@NO] boolValue];
+    // 默认 1.8 倍：156×76 的 1/3 版被反馈"太小"，1.8 倍约 281×137，介于"小巧"和"原来那个大块"之间。
+    double panelScale = [[self valueForKey:@"LandscapePanelScale" fallback:@1.8] doubleValue];
+    if (!isfinite(panelScale) || panelScale <= 0.0) panelScale = 1.8;
+    self.landscapePanelScale = MAX(0.8, MIN(3.0, panelScale));
     id allowList = [self valueForKey:@"LandscapeAppAllowList" fallback:@[]];
     self.landscapeAppAllowList = [allowList isKindOfClass:[NSArray class]] ? allowList : @[];
     self.landscapeCustomBackground = [[self valueForKey:@"LandscapeCustomBackground" fallback:@NO] boolValue];

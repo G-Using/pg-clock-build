@@ -22,6 +22,8 @@ FOUNDATION_EXPORT NSString *const PGPreferencesChangedNotification;
 @property (nonatomic, readonly) BOOL landscapeAppFilterEnabled;
 /// 白名单（bundle identifier 数组）。只在 landscapeAppFilterEnabled 为 YES 时有意义。
 @property (nonatomic, copy, readonly) NSArray<NSString *> *landscapeAppAllowList;
+/// 播放面板的缩放倍数：1.0 = 156×76 的紧凑版，最大 3.0 ≈ 468×228（≈ 最初那版大小）。
+@property (nonatomic, readonly) CGFloat landscapePanelScale;
 /// 横屏块使用独立的自定义背景色，不再跟随上面那组"背景"设置。
 @property (nonatomic, readonly) BOOL landscapeCustomBackground;
 @property (nonatomic, readonly) UIColor *landscapeBackgroundColor;

@@ -148,7 +148,10 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self preferenceNamed:@"上滑时显示" key:@"ShowOnSwipeUp" defaultValue:@YES cell:PSSwitchCell]];
     [items addObject:[self preferenceNamed:@"横屏时显示（竖屏自动隐藏）" key:@"LandscapeAlwaysOn" defaultValue:@YES cell:PSSwitchCell]];
 
-    [items addObject:[PSSpecifier groupSpecifierWithName:@"显示"]];
+    PSSpecifier *display = [PSSpecifier groupSpecifierWithName:@"显示"];
+    [display setProperty:@"下面这些主要影响从屏幕顶部下滑出来的那条信息条（上滑面板）；横屏卡片的时间格式会跟随「使用 12 小时制」，字体大小则跟随上面的「卡片大小」。"
+                  forKey:PSFooterTextGroupKey];
+    [items addObject:display];
     [items addObject:[self preferenceNamed:@"使用 12 小时制" key:@"Disable24H" defaultValue:@NO cell:PSSwitchCell]];
     [items addObject:[self preferenceNamed:@"充电图标" key:@"ChargingIcon" defaultValue:@YES cell:PSSwitchCell]];
     [items addObject:[self preferenceNamed:@"双行显示" key:@"TwoLine" defaultValue:@NO cell:PSSwitchCell]];
@@ -177,27 +180,43 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self preferenceNamed:@"仅指定 App 生效" key:@"LandscapeAppFilterEnabled" defaultValue:@NO cell:PSSwitchCell]];
     [items addObject:[self buttonNamed:[self landscapeAppsButtonTitle] action:@selector(chooseLandscapeApps)]];
 
-    PSSpecifier *landscape = [PSSpecifier groupSpecifierWithName:@"横屏块"];
-    [landscape setProperty:@"横屏块固定单排显示（CPU 指标 + 电池温度 + 时间 + 电量在同一行），贴在屏幕最上方居中；竖屏自动隐藏。CPU 默认显示实时占用率——iOS 不开放真正的瞬时主频，读到的\"最高频率\"在部分机型上并不可信（会把别的频率表读成 CPU 频率），想要看的话可以在下面切换。"
+    PSSpecifier *landscape = [PSSpecifier groupSpecifierWithName:@"横屏音乐卡片"];
+    [landscape setProperty:@"横屏时只留这一张卡片。第一行：时间 / 电量（充电带闪电）/ 电池温度 / CPU 占用率；第二行：封面 + 歌名 + 歌手 + 实时歌词（没在放歌也保留封面，文案写「未播放」）。\n\n播放控制默认隐藏：长按整张卡片才展开（上一首 / 播放暂停 / 下一首 + 进度条），松手后 3 秒自动收起，按按钮会重新计时；双指点击也能展开，双指捏合可直接调大小。\n\n整张卡只有一套背景：毛玻璃 + 可调模糊半径 / 不透明度 / 色调。歌词按「歌名 + 歌手 + 时长」联网匹配（网易云，无结果时换 LRCLIB），需要联网；匹配不到显示「暂无歌词」。"
                     forKey:PSFooterTextGroupKey];
     [items addObject:landscape];
-    [items addObject:[self preferenceNamed:@"显示正在播放的音乐" key:@"LandscapeMusic" defaultValue:@YES cell:PSSwitchCell]];
-    [items addObject:[self preferenceNamed:@"时间前显示 CPU 与电池温度" key:@"LandscapeMetrics" defaultValue:@YES cell:PSSwitchCell]];
-    [items addObject:[self preferenceNamed:@"CPU 显示占用率（关＝芯片最高频率）" key:@"LandscapeMetricsUsage" defaultValue:@YES cell:PSSwitchCell]];
-    [items addObject:[self preferenceNamed:@"横屏块自定义背景色" key:@"LandscapeCustomBackground" defaultValue:@NO cell:PSSwitchCell]];
-    [items addObject:[self buttonNamed:@"横屏块背景颜色" action:@selector(chooseLandscapeBackgroundColor)]];
 
-    PSSpecifier *musicFooter = [PSSpecifier groupSpecifierWithName:@"播放控制"];
-    [musicFooter setProperty:@"边玩游戏边听歌时，横屏块会接上「♪ 歌名 · 歌手」。点一下横屏块弹出毛玻璃播放面板：封面、歌名、进度条，上一首 / 播放暂停 / 下一首，右下角可直接跳到正在播放的 App；6 秒无操作自动收起，再点一下也能收起。"
-                       forKey:PSFooterTextGroupKey];
-    [items addObject:musicFooter];
+    PSSpecifier *cardSize = [self preferenceNamed:@"卡片大小" key:@"LandscapeCardScale"
+                                     defaultValue:@1.35 cell:PSSliderCell];
+    [cardSize setProperty:@0.7 forKey:PSControlMinimumKey];
+    [cardSize setProperty:@2.2 forKey:PSControlMaximumKey];
+    [cardSize setProperty:@YES forKey:@"showValue"];
+    [cardSize setProperty:@"小" forKey:@"minLabel"];
+    [cardSize setProperty:@"大" forKey:@"maxLabel"];
+    [items addObject:cardSize];
+
+    PSSpecifier *glassBlur = [self preferenceNamed:@"毛玻璃模糊" key:@"LandscapeGlassBlur"
+                                      defaultValue:@38.0 cell:PSSliderCell];
+    [glassBlur setProperty:@0.0 forKey:PSControlMinimumKey];
+    [glassBlur setProperty:@80.0 forKey:PSControlMaximumKey];
+    [glassBlur setProperty:@YES forKey:@"showValue"];
+    [items addObject:glassBlur];
+
+    PSSpecifier *glassOpacity = [self preferenceNamed:@"玻璃不透明度" key:@"LandscapeGlassOpacity"
+                                         defaultValue:@0.80 cell:PSSliderCell];
+    [glassOpacity setProperty:@0.30 forKey:PSControlMinimumKey];
+    [glassOpacity setProperty:@1.0 forKey:PSControlMaximumKey];
+    [glassOpacity setProperty:@YES forKey:@"showValue"];
+    [items addObject:glassOpacity];
+
+    [items addObject:[self buttonNamed:@"玻璃色调" action:@selector(chooseLandscapeTintColor)]];
+    [items addObject:[self preferenceNamed:@"显示歌词" key:@"LandscapeLyrics" defaultValue:@YES cell:PSSwitchCell]];
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"操作"]];
     [items addObject:[self buttonNamed:@"恢复默认设置" action:@selector(onResetSettings)]];
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.1-29" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.2-0" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     self.lastLandscapeAppCount = [self selectedLandscapeAppCount];
@@ -295,12 +314,10 @@ static void PGWriteValue(NSString *key, id value) {
                        fallback:[UIColor colorWithRed:0 green:0.68 blue:1 alpha:1]];
 }
 
-/// 选横屏块专属背景色时顺手把开关打开 —— 否则用户挑完颜色却看不出任何变化。
-- (void)chooseLandscapeBackgroundColor {
-    PGWriteValue(@"LandscapeCustomBackground", @YES);
-    [self reloadSpecifiers];
-    [self showColorPickerForKey:@"LandscapeBackgroundColor"
-                       fallback:[UIColor colorWithRed:0 green:0.75 blue:1 alpha:1]];
+/// 玻璃色调就是卡片底色，选完立刻生效，不需要额外的开关。
+- (void)chooseLandscapeTintColor {
+    [self showColorPickerForKey:@"LandscapeGlassTint"
+                       fallback:[UIColor colorWithRed:0.043 green:0.059 blue:0.078 alpha:1.0]];
 }
 
 - (void)chooseLandscapeApps {
@@ -343,8 +360,9 @@ static void PGWriteValue(NSString *key, id value) {
 
 - (void)onResetSettings {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
-                      @"LandscapeMusic", @"LandscapeMetrics", @"LandscapeMetricsUsage", @"LandscapeCustomBackground", @"LandscapeBackgroundColor",
-                      @"LandscapeAppFilterEnabled", @"LandscapeAppAllowList",
+                      @"LandscapeCardScale", @"LandscapeGlassBlur", @"LandscapeGlassOpacity",
+                      @"LandscapeGlassTint", @"LandscapeLyrics",
+                      @"LandscapeAppFilterEnabled", @"LandscapeAppAllowList", @"LandscapePanelScale",
                       @"Disable24H", @"ChargingIcon",
                       @"TwoLine", @"TextColor", @"GrabberStyle", @"FontSize", @"FontStyle",
                       @"EnabledBackgroundColor", @"BackgroundColor",

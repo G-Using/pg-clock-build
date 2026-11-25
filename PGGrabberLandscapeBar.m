@@ -2,6 +2,8 @@
 #import "PGGrabberOverlayView.h"
 #import "PerfectGrabberPreferences.h"
 #import "PGNowPlaying.h"
+#import "PGHardwareMetrics.h"
+#import "PGLyricsProvider.h"
 #import <QuartzCore/QuartzCore.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMotion/CoreMotion.h>
@@ -55,9 +57,8 @@ static const CFTimeInterval PGLandscapeReshowDelay = 0.40;
 /// 显示后至少保持这么久，期间方向抖动不收起。
 static const CFTimeInterval PGLandscapeMinVisible = 0.60;
 
-/// 音乐区（歌名那一段）的显示 / 隐藏要先稳定这么久才生效。
-/// 正在播放的探针在切前台、App 切换、锁屏时会有一两次失准，宽度跟着来回跳就是闪。
-static const CFTimeInterval PGLandscapeMusicDebounce = 0.80;
+/// 控制区松手后保留多久。按按钮会重新计时，所以"正在操作"时不会被收走。
+static const CFTimeInterval PGCardControlsGraceSeconds = 3.0;
 
 /// 加速计启动失败后的重试间隔与次数。dyld 早期 CoreMotion 常报不可用，不能一次失败就永久放弃。
 static const CFTimeInterval PGLandscapeMotionRetryInterval = 3.0;
@@ -288,60 +289,25 @@ static BOOL PGStartFBSObserver(void) {
     return YES;
 }
 
-#pragma mark - 视图与窗口
 
-/// 复用的样式方法，定义在 PGGrabberOverlayView.m 内。
-@interface PGGrabberOverlayView (PGLandscapeStyle)
-- (void)applyAppearance;
-@end
+#pragma mark - 横屏音乐卡片
 
-@interface PGLandscapeBarView : PGGrabberOverlayView
-@end
-
-@implementation PGLandscapeBarView
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.clipsToBounds = YES;
-        self.layer.cornerRadius = 10.0;
-        // 横屏块恒单排：时间、电量、（音乐）全在一条线上。
-        self.forceSingleLine = YES;
-        // 需要接受点按（点一下弹播放控制面板），子标签自己不拦触摸。
-        self.userInteractionEnabled = YES;
-    }
-    return self;
-}
-
-- (void)applyAppearance {
-    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
-    self.backgroundOverrideColor = preferences.landscapeCustomBackground
-        ? preferences.landscapeBackgroundColor
-        : nil;
-    [super applyAppearance];
-    self.layer.cornerRadius = 10.0;
-    self.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner |
-                               kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
-}
-
-/// 胶囊只有 30 来点高，横屏打游戏时手指很容易点偏上下边缘。
-/// 命中区上下各放宽 10pt、左右 6pt —— 只影响 hitTest，视觉尺寸不变；
-/// 屏幕最上面那条边在游戏里也没有可点的东西，吃掉它没有代价。
-- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    CGRect hitBounds = CGRectInset(self.bounds, -6.0, -10.0);
-    return CGRectContainsPoint(hitBounds, point);
-}
-
-@end
-
-#pragma mark - 播放控制面板
-
-/// 点一下胶囊弹出来的播放面板：毛玻璃卡片 + 封面 + 歌名/歌手 + 进度条 + 上一首/播放暂停/下一首。
-@interface PGLandscapeControlPanel : UIView
+/// 横屏时唯一的一块 UI：一张卡片里塞三段
+///   ① 状态行：时间 / 电量（充电带闪电）/ 电池温度 / CPU 占用率
+///   ② 歌曲区：封面 + 歌名 + 歌手 + 实时歌词（没在放歌也保留封面区，文案「未播放」）
+///   ③ 播放控制区：进度条 + 上一首 / 播放暂停 / 下一首 —— 默认隐藏，长按整张卡片才展开
+///
+/// 由 1.1 系列的 PGLandscapeControlPanel 演化而来：毛玻璃、进度锚点、按倍数排版全部沿用，
+/// 只是从「点胶囊弹出的浮动面板」变成「横屏时唯一常驻的卡片」，并补上状态行与歌词。
+/// 旧的胶囊（PGLandscapeBarView）与独立面板一起退役，屏幕上不再同时出现两块东西。
+@interface PGLandscapeMusicCard : UIView
 @property (nonatomic, copy, nullable) void (^onPrevious)(void);
 @property (nonatomic, copy, nullable) void (^onToggle)(void);
 @property (nonatomic, copy, nullable) void (^onNext)(void);
+/// 点封面跳到正在播放的 App。
 @property (nonatomic, copy, nullable) void (^onOpenApplication)(void);
+@property (nonatomic, assign, readonly) BOOL controlsVisible;
+
 - (void)updateTitle:(nullable NSString *)title
              artist:(nullable NSString *)artist
             playing:(BOOL)playing
@@ -349,46 +315,147 @@ static BOOL PGStartFBSObserver(void) {
            duration:(double)duration
         artworkData:(nullable NSData *)artworkData
          canOpenApp:(BOOL)canOpenApp;
+
+/// 播放控制区的展开 / 收起。卡片高度由宿主（PGLandscapeBar）负责，这里只管内容与透明度。
+- (void)setControlsVisible:(BOOL)visible animated:(BOOL)animated;
+
+- (void)startTicking;
+- (void)stopTicking;
+/// 点按落点判定，返回 YES 表示这次点按已被消费（点在封面上 → 跳播放器）。
+- (BOOL)handleTapAtPoint:(CGPoint)point;
 @end
 
-/// 面板内边距。
-static const CGFloat PGPanelPadding = 16.0;
-/// 封面边长。
-static const CGFloat PGPanelArtworkSize = 76.0;
-/// 面板高度（宽度按屏幕给，见 placePanelInSpace:）。
-static const CGFloat PGPanelHeight = 200.0;
+/// 设计稿尺寸（1.0 倍）。实际尺寸 = 常量 × LandscapeCardScale（0.7 ~ 2.2，默认 1.35）。
+static const CGFloat PGCardDesignWidth = 320.0;
+/// 控制区收起时的高度。
+static const CGFloat PGCardCollapsedHeight = 96.0;
+/// 控制区展开时的高度。
+static const CGFloat PGCardExpandedHeight = 150.0;
+static const CGFloat PGCardPadding = 10.0;
+static const CGFloat PGCardArtworkSize = 48.0;
+static const CGFloat PGCardCornerRadius = 18.0;
 
-@implementation PGLandscapeControlPanel {
+/// 卡片的外观偏好。直接读 CFPreferences 而不是走 sharedPreferences 的 3 秒缓存 ——
+/// 用户在设置里拖滑块时要立刻看到变化（卡片每 0.5 秒会重排一次）。
+static id PGCardPreference(NSString *key, id fallback) {
+    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key,
+                                                        (__bridge CFStringRef)PGPreferencesDomain);
+    return CFBridgingRelease(value) ?: fallback;
+}
+
+static CGFloat PGCardBlurRadius(void) {
+    id value = PGCardPreference(@"LandscapeGlassBlur", @38.0);
+    double radius = [value respondsToSelector:@selector(doubleValue)] ? [value doubleValue] : 38.0;
+    if (!isfinite(radius)) return 38.0;
+    return MAX(0.0, MIN(80.0, radius));
+}
+
+static CGFloat PGCardGlassOpacity(void) {
+    id value = PGCardPreference(@"LandscapeGlassOpacity", @0.80);
+    double opacity = [value respondsToSelector:@selector(doubleValue)] ? [value doubleValue] : 0.80;
+    if (!isfinite(opacity) || opacity <= 0.0) return 0.80;
+    return MAX(0.30, MIN(1.0, opacity));
+}
+
+static UIColor *PGCardTintColor(void) {
+    NSString *hex = PGCardPreference(@"LandscapeGlassTint", @"#0B0F14");
+    return [PerfectGrabberPreferences colorFromHexString:hex
+                                               fallback:[UIColor colorWithWhite:0.04 alpha:1.0]];
+}
+
+static BOOL PGCardShowsLyrics(void) {
+    id value = PGCardPreference(@"LandscapeLyrics", @YES);
+    return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : YES;
+}
+
+/// 卡片当前倍数。0.7 ~ 2.2，默认 1.35（320 → 432 宽，横屏 932 宽下约占 46%）。
+static CGFloat PGCardScaleValue(void) {
+    id value = PGCardPreference(@"LandscapeCardScale", @1.35);
+    double scale = [value respondsToSelector:@selector(doubleValue)] ? [value doubleValue] : 1.35;
+    if (!isfinite(scale) || scale <= 0.0) return 1.35;
+    return MAX(0.7, MIN(2.2, scale));
+}
+
+static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFontWeight weight) {
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *configuration =
+            [UIImageSymbolConfiguration configurationWithPointSize:MAX(6.0, pointSize) weight:weight];
+        return [UIImage systemImageNamed:name withConfiguration:configuration];
+    }
+    return nil;
+}
+
+@class SBUIController;
+@interface SBUIController : NSObject
++ (instancetype)sharedInstance;
+- (NSInteger)batteryCapacityAsPercentage;
+- (BOOL)isOnAC;
+@end
+
+@implementation PGLandscapeMusicCard {
     UIVisualEffectView *_blurView;
-    /// 叠在毛玻璃之上的极淡暗渐变：只压住底部按钮区的对比度，不做整块压暗，
-    /// 否则面板又变回"半透明色块"，透不出背后的画面。
     UIView *_tintView;
     CAGradientLayer *_tintGradient;
-    /// 左上到右下的白色高光，模拟玻璃反光。
     UIView *_sheenView;
     CAGradientLayer *_sheenGradient;
-    BOOL _didBoostBlur;
+
+    // ① 状态行
+    UILabel *_clockLabel;
+    UIImageView *_boltIcon;
+    UIImageView *_batteryIcon;
+    UILabel *_batteryLabel;
+    UIImageView *_thermalIcon;
+    UILabel *_thermalLabel;
+    UILabel *_cpuLabel;
+    UIView *_separator;
+
+    // ② 歌曲区
+    UIView *_artworkContainer;
     UIImageView *_artworkView;
+    UIImageView *_artworkPlaceholder;
     UILabel *_titleLabel;
-    UILabel *_subtitleLabel;
-    UILabel *_elapsedLabel;
-    UILabel *_remainingLabel;
+    UILabel *_artistLabel;
+    UILabel *_lyricLabel;
+
+    // ③ 播放控制区
+    UIView *_controlsContainer;
     UIView *_progressTrack;
     UIView *_progressFill;
     CAGradientLayer *_progressGradient;
+    UILabel *_elapsedLabel;
+    UILabel *_remainingLabel;
     UIButton *_previousButton;
     UIButton *_toggleButton;
     UIButton *_nextButton;
-    UIButton *_openButton;
 
-    /// 进度条的锚点：MediaRemote 的 elapsed 只按秒级更新，两次更新之间用本地时钟补齐，
-    /// 否则进度条是一秒一跳。只有"漂移超过 0.75 秒"或"暂停/换曲"才重新对齐。
+    // 状态缓存
+    NSString *_batterySymbol;
+    NSString *_shownTitle;
+    NSString *_shownArtist;
+    NSString *_trackKey;
+    NSString *_lyricPrimary;
+    NSString *_lyricSecondary;
+    NSDateFormatter *_clockFormatter;
+    NSData *_lastArtworkData;
+    BOOL _hasMedia;
+    BOOL _controlsVisible;
+    BOOL _canOpenApp;
+    NSInteger _tickCount;
+    NSTimer *_tickTimer;
+
+    // 进度锚点：MediaRemote 的 elapsed 只按秒级更新，两次更新之间用本地时钟补齐。
     double _anchorElapsed;
     double _duration;
     BOOL _playing;
     CFTimeInterval _anchorTime;
-    NSTimer *_tickTimer;
-    NSData *_lastArtworkData;
+
+    // 上次应用过的大小 / 外观，避免每帧重建字体与滤镜。
+    CGFloat _appliedScale;
+    CGFloat _appliedTextScale;
+    CGFloat _appliedBlur;
+    CGFloat _appliedOpacity;
+    NSString *_appliedTintKey;
+    BOOL _appliedLyrics;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -396,14 +463,14 @@ static const CGFloat PGPanelHeight = 200.0;
     if (self) {
         self.userInteractionEnabled = YES;
         self.backgroundColor = UIColor.clearColor;
-        self.layer.cornerRadius = 22.0;
+        self.layer.cornerRadius = PGCardCornerRadius;
         self.layer.cornerCurve = kCACornerCurveContinuous;
         self.clipsToBounds = YES;
-        self.layer.borderWidth = 1.0 / MAX(UIScreen.mainScreen.scale, 1.0);
-        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.26].CGColor;
+        self.layer.borderWidth = 1.2 / MAX(UIScreen.mainScreen.scale, 1.0);
+        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.38].CGColor;
 
-        // 毛玻璃：ultraThin 是最透的一档 —— 背后游戏的色块会被糊开、颜色透上来，
-        // 而不是像 thinMaterial 那样把整块压成深灰。可读性靠上面的渐变 + 文字阴影补。
+        // 毛玻璃：ultraThin 最透，背后游戏的色块会被糊开、颜色透上来。
+        // 半径与不透明度都可由用户调（设置里的两个滑块），默认值沿用 1.1-33 调通透后的那套。
         UIBlurEffect *effect = nil;
         if (@available(iOS 13.0, *)) {
             effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
@@ -412,95 +479,40 @@ static const CGFloat PGPanelHeight = 200.0;
         }
         _blurView = [[UIVisualEffectView alloc] initWithEffect:effect];
         _blurView.userInteractionEnabled = NO;
+        _blurView.alpha = 0.80;
         [self addSubview:_blurView];
 
-        // 只压底部（按钮/进度条所在的那半），顶部保持通透。
+        // 用户选的色调叠一层，透明度跟着玻璃浓度走：越不透明，颜色越明显。
         _tintView = [UIView new];
         _tintView.userInteractionEnabled = NO;
         _tintGradient = [CAGradientLayer layer];
-        _tintGradient.colors = @[(__bridge id)[UIColor colorWithWhite:0.0 alpha:0.02].CGColor,
-                                 (__bridge id)[UIColor colorWithWhite:0.0 alpha:0.10].CGColor,
-                                 (__bridge id)[UIColor colorWithWhite:0.0 alpha:0.26].CGColor];
-        _tintGradient.locations = @[@0.0, @0.55, @1.0];
         _tintGradient.startPoint = CGPointMake(0.5, 0.0);
         _tintGradient.endPoint = CGPointMake(0.5, 1.0);
         [_tintView.layer addSublayer:_tintGradient];
         [self addSubview:_tintView];
 
+        // 左上角一抹高光，模拟玻璃反光。
         _sheenView = [UIView new];
         _sheenView.userInteractionEnabled = NO;
         _sheenGradient = [CAGradientLayer layer];
-        _sheenGradient.colors = @[(__bridge id)[UIColor colorWithWhite:1.0 alpha:0.16].CGColor,
-                                  (__bridge id)[UIColor colorWithWhite:1.0 alpha:0.05].CGColor,
+        _sheenGradient.colors = @[(__bridge id)[UIColor colorWithWhite:1.0 alpha:0.18].CGColor,
+                                  (__bridge id)[UIColor colorWithWhite:1.0 alpha:0.04].CGColor,
                                   (__bridge id)[UIColor colorWithWhite:1.0 alpha:0.0].CGColor];
-        _sheenGradient.locations = @[@0.0, @0.45, @1.0];
+        _sheenGradient.locations = @[@0.0, @0.35, @1.0];
         _sheenGradient.startPoint = CGPointMake(0.0, 0.0);
         _sheenGradient.endPoint = CGPointMake(0.35, 0.55);
         [_sheenView.layer addSublayer:_sheenGradient];
         [self addSubview:_sheenView];
 
-        _artworkView = [UIImageView new];
-        _artworkView.contentMode = UIViewContentModeScaleAspectFill;
-        _artworkView.clipsToBounds = YES;
-        _artworkView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-        _artworkView.layer.cornerCurve = kCACornerCurveContinuous;
-        if (@available(iOS 13.0, *)) {
-            _artworkView.image = [UIImage systemImageNamed:@"music.note"];
-            _artworkView.tintColor = [UIColor colorWithWhite:1.0 alpha:0.55];
-            _artworkView.contentMode = UIViewContentModeCenter;
-        }
-        [self addSubview:_artworkView];
+        [self buildStatusRow];
+        [self buildSongSection];
+        [self buildControlsSection];
 
-        _titleLabel = [UILabel new];
-        _titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
-        _titleLabel.textColor = UIColor.whiteColor;
-        _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        _titleLabel.layer.shadowColor = UIColor.blackColor.CGColor;
-        _titleLabel.layer.shadowOpacity = 0.45;
-        _titleLabel.layer.shadowRadius = 3.0;
-        _titleLabel.layer.shadowOffset = CGSizeMake(0.0, 1.0);
-        [self addSubview:_titleLabel];
-
-        _subtitleLabel = [UILabel new];
-        _subtitleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular];
-        _subtitleLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.78];
-        _subtitleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        _subtitleLabel.layer.shadowColor = UIColor.blackColor.CGColor;
-        _subtitleLabel.layer.shadowOpacity = 0.40;
-        _subtitleLabel.layer.shadowRadius = 3.0;
-        _subtitleLabel.layer.shadowOffset = CGSizeMake(0.0, 1.0);
-        [self addSubview:_subtitleLabel];
-
-        _elapsedLabel = [self timeLabelWithAlignment:NSTextAlignmentLeft];
-        _remainingLabel = [self timeLabelWithAlignment:NSTextAlignmentRight];
-        [self addSubview:_elapsedLabel];
-        [self addSubview:_remainingLabel];
-
-        _progressTrack = [UIView new];
-        _progressTrack.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.26];
-        _progressTrack.clipsToBounds = YES;
-        [self addSubview:_progressTrack];
-
-        _progressFill = [UIView new];
-        _progressGradient = [CAGradientLayer layer];
-        _progressGradient.colors = @[(__bridge id)[UIColor colorWithWhite:1.0 alpha:0.98].CGColor,
-                                     (__bridge id)[UIColor colorWithRed:1.0 green:0.70 blue:0.42 alpha:1.0].CGColor];
-        _progressGradient.startPoint = CGPointMake(0.0, 0.5);
-        _progressGradient.endPoint = CGPointMake(1.0, 0.5);
-        [_progressFill.layer addSublayer:_progressGradient];
-        [_progressTrack addSubview:_progressFill];
-
-        _previousButton = [self buttonWithSymbol:@"backward.fill" pointSize:20.0 action:@selector(tappedPrevious)];
-        _nextButton = [self buttonWithSymbol:@"forward.fill" pointSize:20.0 action:@selector(tappedNext)];
-        _toggleButton = [self buttonWithSymbol:@"play.fill" pointSize:26.0 action:@selector(tappedToggle)];
-        _toggleButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.18];
-        _openButton = [self buttonWithSymbol:@"arrow.up.forward.app.fill" pointSize:18.0
-                                     action:@selector(tappedOpen)];
-        _openButton.tintColor = [UIColor colorWithWhite:1.0 alpha:0.85];
-
-        for (UIButton *button in @[_previousButton, _toggleButton, _nextButton, _openButton]) {
-            [self addSubview:button];
-        }
+        self.clipsToBounds = YES;
+        _controlsVisible = NO;
+        _controlsContainer.hidden = YES;
+        _controlsContainer.alpha = 0.0;
+        _controlsContainer.userInteractionEnabled = NO;
     }
     return self;
 }
@@ -509,11 +521,154 @@ static const CGFloat PGPanelHeight = 200.0;
     [_tickTimer invalidate];
 }
 
-#pragma mark 控件构造
+#pragma mark 构造
+
+- (void)buildStatusRow {
+    _clockLabel = [UILabel new];
+    _clockLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightSemibold];
+    _clockLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.96];
+    _clockLabel.numberOfLines = 1;
+    [self addSubview:_clockLabel];
+
+    _boltIcon = [UIImageView new];
+    _boltIcon.image = PGCardSymbol(@"bolt.fill", 8.0, UIFontWeightBold);
+    _boltIcon.tintColor = [UIColor colorWithRed:1.0 green:0.84 blue:0.22 alpha:1.0];
+    _boltIcon.contentMode = UIViewContentModeScaleAspectFit;
+    _boltIcon.hidden = YES;
+    [self addSubview:_boltIcon];
+
+    _batteryIcon = [UIImageView new];
+    _batteryIcon.tintColor = [UIColor colorWithWhite:1.0 alpha:0.90];
+    _batteryIcon.contentMode = UIViewContentModeScaleAspectFit;
+    [self addSubview:_batteryIcon];
+
+    _batteryLabel = [UILabel new];
+    _batteryLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightMedium];
+    _batteryLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.92];
+    _batteryLabel.numberOfLines = 1;
+    [self addSubview:_batteryLabel];
+
+    _thermalIcon = [UIImageView new];
+    if (@available(iOS 15.0, *)) {
+        _thermalIcon.image = PGCardSymbol(@"thermometer.medium", 9.0, UIFontWeightMedium);
+    }
+    if (!_thermalIcon.image) _thermalIcon.image = PGCardSymbol(@"thermometer", 9.0, UIFontWeightMedium);
+    _thermalIcon.tintColor = [UIColor colorWithWhite:1.0 alpha:0.88];
+    _thermalIcon.contentMode = UIViewContentModeScaleAspectFit;
+    [self addSubview:_thermalIcon];
+
+    _thermalLabel = [UILabel new];
+    _thermalLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightMedium];
+    _thermalLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.92];
+    _thermalLabel.numberOfLines = 1;
+    [self addSubview:_thermalLabel];
+
+    _cpuLabel = [UILabel new];
+    _cpuLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightMedium];
+    _cpuLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.92];
+    _cpuLabel.textAlignment = NSTextAlignmentRight;
+    _cpuLabel.numberOfLines = 1;
+    [self addSubview:_cpuLabel];
+
+    _separator = [UIView new];
+    _separator.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.16];
+    [self addSubview:_separator];
+}
+
+- (void)buildSongSection {
+    // 封面用普通容器而不是 UIButton：按钮会把触摸从卡片手势里抢走，
+    // 那样"长按整张卡片"在封面上就不成立了。点封面跳 App 改由卡片统一判定落点。
+    _artworkContainer = [UIView new];
+    _artworkContainer.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.10];
+    _artworkContainer.userInteractionEnabled = NO;
+    _artworkContainer.layer.cornerCurve = kCACornerCurveContinuous;
+    _artworkContainer.layer.borderWidth = 1.0 / MAX(UIScreen.mainScreen.scale, 1.0);
+    _artworkContainer.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.24].CGColor;
+    [self addSubview:_artworkContainer];
+
+    _artworkView = [UIImageView new];
+    _artworkView.contentMode = UIViewContentModeScaleAspectFill;
+    _artworkView.clipsToBounds = YES;
+    _artworkView.userInteractionEnabled = NO;
+    [_artworkContainer addSubview:_artworkView];
+
+    _artworkPlaceholder = [UIImageView new];
+    _artworkPlaceholder.image = PGCardSymbol(@"music.note", 16.0, UIFontWeightMedium);
+    _artworkPlaceholder.tintColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+    _artworkPlaceholder.contentMode = UIViewContentModeCenter;
+    _artworkPlaceholder.userInteractionEnabled = NO;
+    [_artworkContainer addSubview:_artworkPlaceholder];
+
+    _titleLabel = [UILabel new];
+    _titleLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
+    _titleLabel.textColor = UIColor.whiteColor;
+    _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _titleLabel.layer.shadowColor = UIColor.blackColor.CGColor;
+    _titleLabel.layer.shadowOpacity = 0.45;
+    _titleLabel.layer.shadowRadius = 3.0;
+    _titleLabel.layer.shadowOffset = CGSizeMake(0.0, 1.0);
+    [self addSubview:_titleLabel];
+
+    _artistLabel = [UILabel new];
+    _artistLabel.font = [UIFont systemFontOfSize:10.0 weight:UIFontWeightRegular];
+    _artistLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
+    _artistLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _artistLabel.layer.shadowColor = UIColor.blackColor.CGColor;
+    _artistLabel.layer.shadowOpacity = 0.40;
+    _artistLabel.layer.shadowRadius = 3.0;
+    _artistLabel.layer.shadowOffset = CGSizeMake(0.0, 1.0);
+    [self addSubview:_artistLabel];
+
+    // 歌词：当前行 + 下一行（淡）。长歌名也不会把卡片撑开，最多两行。
+    _lyricLabel = [UILabel new];
+    _lyricLabel.numberOfLines = 2;
+    _lyricLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _lyricLabel.layer.shadowColor = UIColor.blackColor.CGColor;
+    _lyricLabel.layer.shadowOpacity = 0.45;
+    _lyricLabel.layer.shadowRadius = 3.0;
+    _lyricLabel.layer.shadowOffset = CGSizeMake(0.0, 1.0);
+    [self addSubview:_lyricLabel];
+}
+
+- (void)buildControlsSection {
+    _controlsContainer = [UIView new];
+    _controlsContainer.hidden = YES;
+    [self addSubview:_controlsContainer];
+
+    _progressTrack = [UIView new];
+    _progressTrack.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.24];
+    _progressTrack.clipsToBounds = YES;
+    [_controlsContainer addSubview:_progressTrack];
+
+    _progressFill = [UIView new];
+    _progressGradient = [CAGradientLayer layer];
+    _progressGradient.colors = @[(__bridge id)[UIColor colorWithWhite:1.0 alpha:0.98].CGColor,
+                                 (__bridge id)[UIColor colorWithRed:1.0 green:0.70 blue:0.42 alpha:1.0].CGColor];
+    _progressGradient.startPoint = CGPointMake(0.0, 0.5);
+    _progressGradient.endPoint = CGPointMake(1.0, 0.5);
+    [_progressFill.layer addSublayer:_progressGradient];
+    [_progressTrack addSubview:_progressFill];
+
+    _elapsedLabel = [self timeLabelWithAlignment:NSTextAlignmentLeft];
+    _remainingLabel = [self timeLabelWithAlignment:NSTextAlignmentRight];
+    [_controlsContainer addSubview:_elapsedLabel];
+    [_controlsContainer addSubview:_remainingLabel];
+
+    _previousButton = [self buttonWithSymbol:@"backward.fill" pointSize:10.0 action:@selector(tappedPrevious)];
+    _nextButton = [self buttonWithSymbol:@"forward.fill" pointSize:10.0 action:@selector(tappedNext)];
+    _toggleButton = [self buttonWithSymbol:@"play.fill" pointSize:13.0 action:@selector(tappedToggle)];
+    _toggleButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.16];
+    _toggleButton.layer.borderWidth = 1.0 / MAX(UIScreen.mainScreen.scale, 1.0);
+    _toggleButton.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.30].CGColor;
+
+    for (UIButton *button in @[_previousButton, _toggleButton, _nextButton]) {
+        [_controlsContainer addSubview:button];
+    }
+}
 
 - (UILabel *)timeLabelWithAlignment:(NSTextAlignment)alignment {
     UILabel *label = [UILabel new];
-    label.font = [UIFont monospacedDigitSystemFontOfSize:12.0 weight:UIFontWeightMedium];
+    label.font = [UIFont monospacedDigitSystemFontOfSize:8.5 weight:UIFontWeightMedium];
     label.textColor = [UIColor colorWithWhite:1.0 alpha:0.85];
     label.textAlignment = alignment;
     label.adjustsFontSizeToFitWidth = YES;
@@ -521,17 +676,10 @@ static const CGFloat PGPanelHeight = 200.0;
     return label;
 }
 
-- (UIButton *)buttonWithSymbol:(NSString *)symbol
-                     pointSize:(CGFloat)pointSize
-                        action:(SEL)action {
+- (UIButton *)buttonWithSymbol:(NSString *)symbol pointSize:(CGFloat)pointSize action:(SEL)action {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    if (@available(iOS 13.0, *)) {
-        UIImageSymbolConfiguration *configuration =
-            [UIImageSymbolConfiguration configurationWithPointSize:pointSize weight:UIFontWeightSemibold];
-        UIImage *image = [UIImage systemImageNamed:symbol withConfiguration:configuration];
-        [button setImage:image forState:UIControlStateNormal];
-        button.tintColor = UIColor.whiteColor;
-    }
+    [button setImage:PGCardSymbol(symbol, pointSize, UIFontWeightSemibold) forState:UIControlStateNormal];
+    button.tintColor = UIColor.whiteColor;
     [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return button;
 }
@@ -545,54 +693,73 @@ static const CGFloat PGPanelHeight = 200.0;
            duration:(double)duration
         artworkData:(NSData *)artworkData
          canOpenApp:(BOOL)canOpenApp {
-    _titleLabel.text = title.length ? title : (playing ? @"正在播放" : @"未在播放");
-    _subtitleLabel.text = artist.length ? artist : @"";
+    NSString *resolvedTitle = title.length ? title : @"未播放";
+    NSString *resolvedArtist = artist.length ? artist : @"";
 
-    if (@available(iOS 13.0, *)) {
-        UIImageSymbolConfiguration *configuration =
-            [UIImageSymbolConfiguration configurationWithPointSize:26.0 weight:UIFontWeightBold];
-        UIImage *image = [UIImage systemImageNamed:(playing ? @"pause.fill" : @"play.fill")
-                                 withConfiguration:configuration];
-        [_toggleButton setImage:image forState:UIControlStateNormal];
+    BOOL layoutChanged = NO;
+    if (![resolvedTitle isEqualToString:(_shownTitle ?: @"")]) {
+        _shownTitle = resolvedTitle;
+        _titleLabel.text = resolvedTitle;
+        layoutChanged = YES;
+    }
+    if (![resolvedArtist isEqualToString:(_shownArtist ?: @"")]) {
+        _shownArtist = resolvedArtist;
+        _artistLabel.text = resolvedArtist;
+        _artistLabel.hidden = resolvedArtist.length == 0;
     }
 
-    _openButton.hidden = !canOpenApp;
-    if (artworkData) [self applyArtworkData:artworkData];
+    BOOL hasMedia = title.length > 0 || artist.length > 0;
+    _hasMedia = hasMedia;
+    _canOpenApp = canOpenApp;
 
-    // 暂停/换曲/拖动进度：直接对齐；正常播放：只在漂移过大时对齐，避免每秒往回跳。
-    BOOL hardSync = playing != _playing || fabs(duration - _duration) > 0.5;
+    BOOL playingChanged = (playing != _playing);
+    _playing = playing;
+    if (playingChanged) [self updateToggleSymbol];
+
+    // 换曲：请求歌词。同一首反复调用是空操作，provider 自己会去重。
+    NSString *trackKey = [NSString stringWithFormat:@"%@|%@", title ?: @"", artist ?: @""];
+    if (![trackKey isEqualToString:(_trackKey ?: @"")]) {
+        _trackKey = trackKey;
+        _lyricPrimary = nil;
+        _lyricSecondary = nil;
+        [self refreshLyricText:YES];
+        [[PGLyricsProvider sharedInstance] requestLyricsForTitle:(hasMedia ? title : nil)
+                                                          artist:(hasMedia ? artist : nil)
+                                                        duration:duration];
+    }
+
+    if (artworkData != _lastArtworkData) {
+        [self applyArtworkData:artworkData];
+    }
+
+    // 暂停 / 换曲 / 拖动进度：直接对齐；正常播放：只在漂移过大时对齐，避免每秒往回跳。
+    BOOL hardSync = playingChanged || fabs(duration - _duration) > 0.5 || !hasMedia;
     if (hardSync) {
+        _anchorElapsed = hasMedia ? elapsed : 0.0;
+        _anchorTime = CACurrentMediaTime();
+    } else if (fabs(elapsed - [self displayedElapsed]) > 0.75) {
         _anchorElapsed = elapsed;
         _anchorTime = CACurrentMediaTime();
-    } else {
-        double displayed = [self displayedElapsed];
-        if (fabs(elapsed - displayed) > 0.75) {
-            _anchorElapsed = elapsed;
-            _anchorTime = CACurrentMediaTime();
-        }
     }
-    _playing = playing;
     _duration = duration;
 
     [self refreshProgress];
-    [self setNeedsLayout];
+    if (layoutChanged) [self setNeedsLayout];
 }
 
 - (void)applyArtworkData:(NSData *)data {
-    // 字典是浅拷贝，同一个 NSData 实例会一直被复用，指针比较就够了，不必每次解码。
-    if (data == _lastArtworkData) return;
     _lastArtworkData = data;
-
     UIImage *image = data.length ? [UIImage imageWithData:data] : nil;
-    if (image) {
-        _artworkView.image = image;
-        _artworkView.contentMode = UIViewContentModeScaleAspectFill;
-        _artworkView.tintColor = nil;
-    } else if (@available(iOS 13.0, *)) {
-        _artworkView.image = [UIImage systemImageNamed:@"music.note"];
-        _artworkView.contentMode = UIViewContentModeCenter;
-        _artworkView.tintColor = [UIColor colorWithWhite:1.0 alpha:0.55];
-    }
+    _artworkView.image = image;
+    _artworkView.hidden = (image == nil);
+    _artworkPlaceholder.hidden = (image != nil);
+    _artworkPlaceholder.image = PGCardSymbol(@"music.note", 16.0, UIFontWeightMedium);
+}
+
+- (void)updateToggleSymbol {
+    CGFloat textScale = _appliedTextScale > 0.0 ? _appliedTextScale : 1.0;
+    UIImage *image = PGCardSymbol(_playing ? @"pause.fill" : @"play.fill", 13.0 * textScale, UIFontWeightBold);
+    [_toggleButton setImage:image forState:UIControlStateNormal];
 }
 
 - (double)displayedElapsed {
@@ -633,9 +800,7 @@ static const CGFloat PGPanelHeight = 200.0;
     if (trackWidth <= 0.0 || trackHeight <= 0.0) return;
 
     double ratio = 0.0;
-    if (_duration > 0.0) {
-        ratio = MIN(1.0, MAX(0.0, [self displayedElapsed] / _duration));
-    }
+    if (_duration > 0.0) ratio = MIN(1.0, MAX(0.0, [self displayedElapsed] / _duration));
     CGFloat fillWidth = trackWidth * (CGFloat)ratio;
     _progressFill.frame = CGRectMake(0.0, 0.0, fillWidth, trackHeight);
     _progressFill.layer.cornerRadius = trackHeight / 2.0;
@@ -643,29 +808,213 @@ static const CGFloat PGPanelHeight = 200.0;
     _progressFill.hidden = fillWidth < 1.0;
 }
 
-#pragma mark 计时
+#pragma mark 歌词
 
-- (void)setHidden:(BOOL)hidden {
-    [super setHidden:hidden];
-    if (hidden) {
-        [_tickTimer invalidate];
-        _tickTimer = nil;
-    } else {
-        [self startTickingIfNeeded];
+- (void)refreshLyricText:(BOOL)force {
+    if (!PGCardShowsLyrics()) {
+        _lyricLabel.hidden = YES;
+        return;
     }
+    _lyricLabel.hidden = NO;
+
+    if (!_hasMedia) {
+        [self applyLyricPrimary:@"长按卡片可控制播放" secondary:nil force:force];
+        return;
+    }
+
+    PGLyricsProvider *provider = PGLyricsProvider.sharedInstance;
+    double elapsed = [self displayedElapsed];
+    NSString *line = [provider lineAtElapsed:elapsed];
+    NSString *next = [provider nextLineAtElapsed:elapsed];
+
+    if (line.length == 0) {
+        if (provider.loading) {
+            [self applyLyricPrimary:@"正在匹配歌词…" secondary:nil force:force];
+        } else if (provider.hasLyrics) {
+            [self applyLyricPrimary:nil secondary:nil force:force];
+        } else {
+            [self applyLyricPrimary:@"暂无歌词" secondary:nil force:force];
+        }
+        return;
+    }
+    [self applyLyricPrimary:line secondary:next force:force];
 }
 
-- (void)startTickingIfNeeded {
-    if (_tickTimer || self.hidden) return;
+- (void)applyLyricPrimary:(NSString *)primary secondary:(NSString *)secondary force:(BOOL)force {
+    if (!force && [primary isEqualToString:(_lyricPrimary ?: @"")] &&
+        [secondary isEqualToString:(_lyricSecondary ?: @"")]) {
+        return;
+    }
+    _lyricPrimary = primary;
+    _lyricSecondary = secondary;
+    [self rebuildLyricAttributedText];
+}
+
+- (void)rebuildLyricAttributedText {
+    CGFloat textScale = _appliedTextScale > 0.0 ? _appliedTextScale : 1.0;
+    if (_lyricPrimary.length == 0 && _lyricSecondary.length == 0) {
+        _lyricLabel.attributedText = nil;
+        _lyricLabel.text = nil;
+        return;
+    }
+
+    UIFont *primaryFont = [UIFont systemFontOfSize:11.0 * textScale weight:UIFontWeightMedium];
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] initWithString:(_lyricPrimary ?: @"")];
+    [text addAttributes:@{NSFontAttributeName: primaryFont,
+                          NSForegroundColorAttributeName: [UIColor colorWithWhite:1.0 alpha:0.96]}
+                  range:NSMakeRange(0, text.length)];
+
+    if (_lyricSecondary.length > 0) {
+        UIFont *secondaryFont = [UIFont systemFontOfSize:9.5 * textScale weight:UIFontWeightRegular];
+        NSAttributedString *next =
+            [[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"\n%@", _lyricSecondary]
+                                            attributes:@{NSFontAttributeName: secondaryFont,
+                                                         NSForegroundColorAttributeName:
+                                                             [UIColor colorWithWhite:1.0 alpha:0.52]}];
+        [text appendAttributedString:next];
+    }
+    _lyricLabel.attributedText = text;
+}
+
+#pragma mark 状态行
+
+- (BOOL)refreshClock {
+    if (!_clockFormatter) {
+        _clockFormatter = [NSDateFormatter new];
+        _clockFormatter.locale = [NSLocale currentLocale];
+    }
+    NSString *format = PerfectGrabberPreferences.sharedPreferences.disable24Hour ? @"h:mm a" : @"HH:mm";
+    if (![_clockFormatter.dateFormat isEqualToString:format]) _clockFormatter.dateFormat = format;
+
+    NSString *text = [_clockFormatter stringFromDate:NSDate.date];
+    if ([text isEqualToString:(_clockLabel.text ?: @"")]) return NO;
+    _clockLabel.text = text;
+    return YES;
+}
+
+- (BOOL)refreshBattery {
+    NSInteger percent = 0;
+    BOOL charging = NO;
+
+    Class controllerClass = NSClassFromString(@"SBUIController");
+    if ([controllerClass respondsToSelector:@selector(sharedInstance)]) {
+        SBUIController *controller = [controllerClass sharedInstance];
+        if ([controller respondsToSelector:@selector(batteryCapacityAsPercentage)]) {
+            percent = MAX(0, MIN(100, [controller batteryCapacityAsPercentage]));
+        }
+        if ([controller respondsToSelector:@selector(isOnAC)]) charging = [controller isOnAC];
+    } else {
+        UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+        CGFloat level = UIDevice.currentDevice.batteryLevel;
+        percent = level < 0 ? 0 : (NSInteger)lround(level * 100.0);
+        UIDeviceBatteryState state = UIDevice.currentDevice.batteryState;
+        charging = state == UIDeviceBatteryStateCharging || state == UIDeviceBatteryStateFull;
+    }
+
+    BOOL changed = NO;
+    NSString *text = [NSString stringWithFormat:@"%ld%%", (long)percent];
+    if (![text isEqualToString:(_batteryLabel.text ?: @"")]) {
+        _batteryLabel.text = text;
+        changed = YES;
+    }
+    if (_boltIcon.hidden == charging) {
+        _boltIcon.hidden = !charging;
+        changed = YES;
+    }
+
+    NSString *symbol = @"battery.100";
+    if (percent <= 5) symbol = @"battery.0";
+    else if (percent <= 35) symbol = @"battery.25";
+    else if (percent <= 60) symbol = @"battery.50";
+    else if (percent <= 85) symbol = @"battery.75";
+    if (![symbol isEqualToString:(_batterySymbol ?: @"")]) {
+        _batterySymbol = symbol;
+        _batteryIcon.image = PGCardSymbol(symbol, 12.0, UIFontWeightRegular);
+        changed = YES;
+    }
+    return changed;
+}
+
+- (BOOL)refreshMetrics {
+    BOOL changed = NO;
+    double celsius = PGBatteryTemperatureCelsius();
+    NSString *thermal = isnan(celsius) ? @"--" : [NSString stringWithFormat:@"%.1f\u00B0C", celsius];
+    if (![thermal isEqualToString:(_thermalLabel.text ?: @"")]) {
+        _thermalLabel.text = thermal;
+        changed = YES;
+    }
+
+    double usage = PGCPUUsagePercent();
+    NSString *cpu = isnan(usage) ? @"CPU --" : [NSString stringWithFormat:@"CPU %2.0f%%", usage];
+    if (![cpu isEqualToString:(_cpuLabel.text ?: @"")]) {
+        _cpuLabel.text = cpu;
+        changed = YES;
+    }
+    return changed;
+}
+
+#pragma mark 计时
+
+- (void)startTicking {
+    if (_tickTimer) return;
+    [self refreshClock];
+    [self refreshBattery];
+    [self refreshMetrics];
+    [self refreshLyricText:YES];
+    [self setNeedsLayout];
     __weak typeof(self) weakSelf = self;
     NSTimer *timer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *fireTimer) {
-        [weakSelf refreshProgress];
+        [weakSelf handleTick];
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
     _tickTimer = timer;
 }
 
+- (void)stopTicking {
+    [_tickTimer invalidate];
+    _tickTimer = nil;
+}
+
+- (void)handleTick {
+    _tickCount++;
+    BOOL statusChanged = [self refreshClock];
+    if (_tickCount % 2 == 1) statusChanged = [self refreshMetrics] || statusChanged;   // 1 秒一次
+    if (_tickCount % 4 == 1) statusChanged = [self refreshBattery] || statusChanged;   // 2 秒一次
+    // 只有文字宽度真的变了才重排：状态行是按文字量宽排的，不变就不用动。
+    if (statusChanged) [self setNeedsLayout];
+    [self refreshProgress];
+    [self refreshLyricText:NO];
+}
+
 #pragma mark 交互
+
+- (void)setControlsVisible:(BOOL)visible animated:(BOOL)animated {
+    if (_controlsVisible == visible) return;
+    _controlsVisible = visible;
+    _controlsContainer.userInteractionEnabled = visible;
+
+    if (visible) {
+        _controlsContainer.hidden = NO;
+        _controlsContainer.alpha = 0.0;
+    }
+    void (^animations)(void) = ^{
+        self->_controlsContainer.alpha = visible ? 1.0 : 0.0;
+    };
+    if (!animated) {
+        animations();
+        _controlsContainer.hidden = !visible;
+        return;
+    }
+    [UIView animateWithDuration:0.18
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction
+                     animations:animations
+                     completion:^(BOOL finished) {
+        // 用当前状态而不是捕获值：动画途中又展开时，别被上一次的 completion 藏回去。
+        if (!self->_controlsVisible) self->_controlsContainer.hidden = YES;
+    }];
+}
 
 - (void)tappedPrevious {
     if (self.onPrevious) self.onPrevious();
@@ -679,113 +1028,186 @@ static const CGFloat PGPanelHeight = 200.0;
     if (self.onNext) self.onNext();
 }
 
-- (void)tappedOpen {
+/// 点按落点判定：点在封面上且确实在放歌 → 跳回播放器（返回 YES，调用方不再处理）。
+/// 卡片是普通视图，手势统一在宿主 PGLandscapeBar 里，所以这里只做几何判断。
+- (BOOL)handleTapAtPoint:(CGPoint)point {
+    if (!_canOpenApp) return NO;
+    if (!CGRectContainsPoint(_artworkContainer.frame, point)) return NO;
     if (self.onOpenApplication) self.onOpenApplication();
+    return YES;
 }
 
-#pragma mark 布局
+#pragma mark 外观
 
-/// 系统材质的模糊半径是固定的（UltraThin 大概只有 20 出头），放大到 42 才有真正的
-/// "毛玻璃"观感：背后的色块完全化开，只剩一片有颜色的雾。
-///
-/// 走的是 UIVisualEffectView 内部的 `_UIVisualEffectBackdropView`，它把 CAFilter 数组
-/// 挂在 `filters` 上。这一段全是私有层级：类名、key、filter 名任何一个对不上就什么都不做，
-/// 所以每一步都用 @try 包住 —— 在 SpringBoard 里崩一次就是安全模式，不能赌。
-static const CGFloat PGBackdropBlurRadius = 42.0;
-
-- (void)enlargeBackdropBlurInView:(UIView *)view depth:(NSInteger)depth {
-    if (!view || depth < 0) return;
-
-    NSString *className = NSStringFromClass(view.class);
-    NSRange match = [className rangeOfString:@"backdrop" options:NSCaseInsensitiveSearch];
-    if (match.location != NSNotFound) {
-        @try {
-            id filters = [view valueForKey:@"filters"];
-            if ([filters isKindOfClass:[NSArray class]]) {
-                NSMutableArray *updated = [NSMutableArray arrayWithCapacity:[filters count]];
-                BOOL changed = NO;
-                for (id filter in (NSArray *)filters) {
-                    NSString *name = nil;
-                    @try {
-                        name = [filter valueForKey:@"name"];
-                    } @catch (NSException *exception) {
-                        (void)exception;
-                    }
-                    if ([name isKindOfClass:[NSString class]] &&
-                        [name rangeOfString:@"blur" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+/// 系统材质的模糊半径是固定的（UltraThin 大概 20 出头），拉到 38 才有真正的毛玻璃观感。
+/// 走 UIVisualEffectView 内部的 `_UIVisualEffectBackdropView`，把 CAFilter 数组挂在 `filters` 上。
+/// 全是私有层级，类名 / key / filter 名任何一个对不上就什么都不做 —— 每一步都包 @try，
+/// 在 SpringBoard 里崩一次就是安全模式，不能赌。
+- (BOOL)boostBackdropBlur:(CGFloat)radius {
+    UIView *backdrop = [self backdropViewInView:_blurView depth:4];
+    if (!backdrop) return NO;
+    @try {
+        id filters = [backdrop valueForKey:@"filters"];
+        NSMutableArray *updated = [NSMutableArray array];
+        BOOL hasBlur = NO;
+        BOOL hasSaturate = NO;
+        if ([filters isKindOfClass:[NSArray class]]) {
+            for (id filter in (NSArray *)filters) {
+                NSString *name = nil;
+                @try {
+                    name = [filter valueForKey:@"name"];
+                } @catch (NSException *exception) {
+                    (void)exception;
+                }
+                if ([name isKindOfClass:[NSString class]]) {
+                    if ([name rangeOfString:@"blur" options:NSCaseInsensitiveSearch].location != NSNotFound) {
                         @try {
-                            [filter setValue:@(PGBackdropBlurRadius) forKey:@"inputRadius"];
-                            changed = YES;
+                            [filter setValue:@(radius) forKey:@"inputRadius"];
+                            hasBlur = YES;
                         } @catch (NSException *exception) {
                             (void)exception;
                         }
+                    } else if ([name rangeOfString:@"Saturate" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                        hasSaturate = YES;
                     }
-                    [updated addObject:filter];
                 }
-                if (changed) {
-                    [view setValue:updated forKey:@"filters"];
-                    PGLog(@"面板: 模糊半径已放大到 %.0f", PGBackdropBlurRadius);
-                }
+                [updated addObject:filter];
             }
-        } @catch (NSException *exception) {
-            (void)exception;
         }
-        return;
-    }
-
-    for (UIView *subview in view.subviews) {
-        [self enlargeBackdropBlurInView:subview depth:depth - 1];
+        if (!hasBlur) return NO;
+        // 通透的第二个关键：ultraThin 会把背后的游戏画面洗成灰，补一个 colorSaturate 把颜色拉回来。
+        if (!hasSaturate) {
+            @try {
+                Class filterClass = NSClassFromString(@"CAFilter");
+                if (filterClass) {
+                    id saturate = ((id (*)(id, SEL, NSString *))objc_msgSend)(
+                        filterClass, NSSelectorFromString(@"filterWithName:"), @"colorSaturate");
+                    if (saturate) {
+                        [saturate setValue:@1.35 forKey:@"inputSaturation"];
+                        [updated addObject:saturate];
+                    }
+                }
+            } @catch (NSException *exception) {
+                (void)exception;
+            }
+        }
+        [backdrop setValue:updated forKey:@"filters"];
+        return YES;
+    } @catch (NSException *exception) {
+        (void)exception;
+        return NO;
     }
 }
+
+- (UIView *)backdropViewInView:(UIView *)view depth:(NSInteger)depth {
+    if (!view || depth < 0) return nil;
+    NSString *className = NSStringFromClass(view.class);
+    if ([className rangeOfString:@"backdrop" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        return view;
+    }
+    for (UIView *subview in view.subviews) {
+        UIView *found = [self backdropViewInView:subview depth:depth - 1];
+        if (found) return found;
+    }
+    return nil;
+}
+
+- (void)applyGlassIfNeeded {
+    CGFloat blur = PGCardBlurRadius();
+    CGFloat opacity = PGCardGlassOpacity();
+    UIColor *tint = PGCardTintColor();
+
+    // ⚠️ 不能用 tint.redComponent：灰度色的 getRed 会抛异常。统一走 getRed:green:blue:alpha:。
+    CGFloat red = 0.0, green = 0.0, blue = 0.0, alpha = 0.0;
+    NSString *tintKey = @"-";
+    if ([tint getRed:&red green:&green blue:&blue alpha:&alpha]) {
+        tintKey = [NSString stringWithFormat:@"%.3f/%.3f/%.3f/%.3f", red, green, blue, alpha];
+    }
+
+    BOOL toneChanged = fabs(opacity - _appliedOpacity) >= 0.01 ||
+                       ![tintKey isEqualToString:(_appliedTintKey ?: @"")];
+    BOOL blurChanged = fabs(blur - _appliedBlur) >= 0.5;
+
+    if (toneChanged) {
+        _appliedOpacity = opacity;
+        _appliedTintKey = tintKey;
+        _blurView.alpha = opacity;
+        // 越不透明，色调越明显；玻璃很透的时候只留一丝色偏，别把游戏画面糊成一块。
+        _tintView.backgroundColor = [tint colorWithAlphaComponent:0.10 + 0.30 * opacity];
+        _tintGradient.colors = @[(__bridge id)[tint colorWithAlphaComponent:0.0].CGColor,
+                                 (__bridge id)[tint colorWithAlphaComponent:0.0].CGColor,
+                                 (__bridge id)[tint colorWithAlphaComponent:0.20].CGColor];
+    }
+
+    // 模糊半径只能在 backdrop 已经建出来之后才设得进去；建不出来就先不记账，等下一拍再试。
+    if (blurChanged && (blur <= 0.5 || [self boostBackdropBlur:blur])) {
+        _appliedBlur = blur;
+    }
+}
+
+#pragma mark 布局
 
 - (void)layoutSubviews {
     [super layoutSubviews];
 
     CGFloat width = CGRectGetWidth(self.bounds);
     CGFloat height = CGRectGetHeight(self.bounds);
+    if (width <= 0.0 || height <= 0.0) return;
+
+    CGFloat s = width / PGCardDesignWidth;
+    if (!isfinite(s) || s <= 0.0) s = 1.0;
+    CGFloat textScale = sqrt(s);
+
     _blurView.frame = self.bounds;
     _tintView.frame = self.bounds;
     _tintGradient.frame = _tintView.bounds;
     _sheenView.frame = self.bounds;
     _sheenGradient.frame = _sheenView.bounds;
 
-    // 第一次上屏时把系统材质的模糊半径拉大（默认半径偏小，看着像"半透明色块"）。
-    // 这是私有层级，某些系统上会失败，失败就维持系统默认，绝不能让它把 SpringBoard 带崩。
-    if (!_didBoostBlur && width > 0.0) {
-        _didBoostBlur = YES;
-        [self enlargeBackdropBlurInView:_blurView depth:4];
-    }
+    [self applyGlassIfNeeded];
+    [self applyScale:s textScale:textScale];
 
-    CGFloat artSize = PGPanelArtworkSize;
-    _artworkView.frame = CGRectMake(PGPanelPadding, PGPanelPadding, artSize, artSize);
-    _artworkView.layer.cornerRadius = artSize / 2.0;
+    CGFloat pad = PGCardPadding * s;
+    CGFloat scale = MAX(UIScreen.mainScreen.scale, 1.0);
 
-    CGFloat textX = PGPanelPadding + artSize + 14.0;
-    CGFloat textWidth = MAX(0.0, width - textX - PGPanelPadding);
-    _titleLabel.frame = CGRectMake(textX, PGPanelPadding + 2.0, textWidth, 22.0);
-    _subtitleLabel.frame = CGRectMake(textX, PGPanelPadding + 26.0, textWidth, 18.0);
+    // ① 状态行
+    [self layoutStatusRowWithWidth:width padding:pad scale:s];
 
-    // 进度行：左边当前时间、右边剩余时间，中间是进度条。
-    CGFloat progressY = PGPanelPadding + artSize + 14.0;
-    CGFloat timeWidth = 42.0;
-    CGFloat trackX = PGPanelPadding + timeWidth + 10.0;
-    CGFloat trackRight = width - PGPanelPadding - timeWidth - 10.0;
-    CGFloat trackWidth = MAX(0.0, trackRight - trackX);
-    CGFloat trackHeight = 5.0;
-    CGFloat trackY = progressY + (16.0 - trackHeight) / 2.0;
+    _separator.frame = CGRectMake(pad, 26.0 * s, MAX(0.0, width - 2.0 * pad), 1.0 / scale);
 
-    _elapsedLabel.frame = CGRectMake(PGPanelPadding, progressY, timeWidth, 16.0);
-    _remainingLabel.frame = CGRectMake(width - PGPanelPadding - timeWidth, progressY, timeWidth, 16.0);
-    _progressTrack.frame = CGRectMake(trackX, trackY, trackWidth, trackHeight);
-    _progressTrack.layer.cornerRadius = trackHeight / 2.0;
+    // ② 歌曲区
+    CGFloat artSize = PGCardArtworkSize * s;
+    CGFloat artY = 33.0 * s;
+    _artworkContainer.frame = CGRectMake(pad, artY, artSize, artSize);
+    _artworkContainer.layer.cornerRadius = 10.0 * s;
+    _artworkView.frame = _artworkContainer.bounds;
+    _artworkView.layer.cornerRadius = 10.0 * s;
+    _artworkPlaceholder.frame = _artworkContainer.bounds;
+
+    CGFloat textX = pad + artSize + 10.0 * s;
+    CGFloat textWidth = MAX(0.0, width - pad - textX);
+    _titleLabel.frame = CGRectMake(textX, artY - 2.0 * s, textWidth, 16.0 * s);
+    _artistLabel.frame = CGRectMake(textX, artY + 14.0 * s, textWidth, 13.0 * s);
+    _lyricLabel.frame = CGRectMake(textX, artY + 27.0 * s, textWidth, 27.0 * s);
+
+    // ③ 播放控制区（高度由宿主的卡片尺寸决定，这里只排内部）
+    CGFloat collapsed = PGCardCollapsedHeight * s;
+    _controlsContainer.frame = CGRectMake(0.0, collapsed, width,
+                                          MAX(0.0, height - collapsed));
+    CGFloat innerWidth = MAX(0.0, width - 2.0 * pad);
+    _progressTrack.frame = CGRectMake(pad, 4.0 * s, innerWidth, 3.0 * s);
+    _progressTrack.layer.cornerRadius = 1.5 * s;
     [self layoutProgressFill];
 
-    // 按钮行：上一首 / 播放暂停 / 下一首 居中，右侧留一个"打开播放器"。
-    CGFloat toggleSize = 52.0;
-    CGFloat sideSize = 40.0;
-    CGFloat gap = 26.0;
-    CGFloat centerY = height - PGPanelPadding - toggleSize / 2.0;
+    CGFloat timeY = 9.0 * s;
+    CGFloat timeWidth = 44.0 * s;
+    _elapsedLabel.frame = CGRectMake(pad, timeY, timeWidth, 10.0 * s);
+    _remainingLabel.frame = CGRectMake(width - pad - timeWidth, timeY, timeWidth, 10.0 * s);
 
+    CGFloat toggleSize = 32.0 * s;
+    CGFloat sideSize = 24.0 * s;
+    CGFloat gap = 18.0 * s;
+    CGFloat centerY = 36.0 * s;
     CGFloat total = sideSize * 2.0 + toggleSize + gap * 2.0;
     CGFloat originX = (width - total) / 2.0;
     _previousButton.frame = CGRectMake(originX, centerY - sideSize / 2.0, sideSize, sideSize);
@@ -796,19 +1218,91 @@ static const CGFloat PGBackdropBlurRadius = 42.0;
     _toggleButton.layer.cornerRadius = toggleSize / 2.0;
     _toggleButton.layer.cornerCurve = kCACornerCurveContinuous;
 
-    CGFloat openSize = 34.0;
-    _openButton.frame = CGRectMake(width - PGPanelPadding - openSize,
-                                   centerY - openSize / 2.0, openSize, openSize);
+    self.layer.cornerRadius = MIN(PGCardCornerRadius * s, height / 2.0);
+}
+
+- (void)layoutStatusRowWithWidth:(CGFloat)width padding:(CGFloat)pad scale:(CGFloat)s {
+    CGFloat y = 6.0 * s;
+    CGFloat h = 15.0 * s;
+    CGFloat x = pad;
+    CGFloat right = width - pad;
+
+    CGSize clockSize = [_clockLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)];
+    _clockLabel.frame = CGRectMake(x, y, ceil(clockSize.width) + 1.0, h);
+    x = CGRectGetMaxX(_clockLabel.frame) + 9.0 * s;
+
+    CGFloat iconHeight = 11.0 * s;
+    if (!_boltIcon.hidden) {
+        _boltIcon.frame = CGRectMake(x, y + (h - iconHeight) / 2.0, 8.0 * s, iconHeight);
+        x += 8.0 * s + 1.0 * s;
+    } else {
+        _boltIcon.frame = CGRectZero;
+    }
+
+    _batteryIcon.frame = CGRectMake(x, y + (h - iconHeight) / 2.0, 22.0 * s, iconHeight);
+    x += 22.0 * s + 2.0 * s;
+
+    CGSize batterySize = [_batteryLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)];
+    _batteryLabel.frame = CGRectMake(x, y, ceil(batterySize.width) + 1.0, h);
+    x = CGRectGetMaxX(_batteryLabel.frame) + 9.0 * s;
+
+    CGFloat thermalHeight = 10.0 * s;
+    _thermalIcon.frame = CGRectMake(x, y + (h - thermalHeight) / 2.0, 9.0 * s, thermalHeight);
+    x += 9.0 * s + 1.0 * s;
+
+    CGSize thermalSize = [_thermalLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)];
+    _thermalLabel.frame = CGRectMake(x, y, ceil(thermalSize.width) + 1.0, h);
+
+    CGSize cpuSize = [_cpuLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)];
+    CGFloat cpuWidth = MIN(ceil(cpuSize.width) + 1.0, MAX(0.0, right - pad));
+    _cpuLabel.frame = CGRectMake(right - cpuWidth, y, cpuWidth, h);
+}
+
+- (void)applyScale:(CGFloat)scale textScale:(CGFloat)textScale {
+    BOOL sizeChanged = fabs(_appliedScale - scale) > 0.001;
+    BOOL textChanged = fabs(_appliedTextScale - textScale) > 0.001;
+    if (!sizeChanged && !textChanged) return;
+
+    _appliedScale = scale;
+    _appliedTextScale = textScale;
+
+    _clockLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 * textScale weight:UIFontWeightSemibold];
+    _batteryLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 * textScale weight:UIFontWeightMedium];
+    _thermalLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 * textScale weight:UIFontWeightMedium];
+    _cpuLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.5 * textScale weight:UIFontWeightMedium];
+
+    _titleLabel.font = [UIFont systemFontOfSize:12.5 * textScale weight:UIFontWeightSemibold];
+    _artistLabel.font = [UIFont systemFontOfSize:10.0 * textScale weight:UIFontWeightRegular];
+
+    _elapsedLabel.font = [UIFont monospacedDigitSystemFontOfSize:8.5 * textScale weight:UIFontWeightMedium];
+    _remainingLabel.font = _elapsedLabel.font;
+
+    CGFloat shadowRadius = 3.0 * textScale;
+    for (UILabel *label in @[_titleLabel, _artistLabel, _lyricLabel]) {
+        label.layer.shadowRadius = shadowRadius;
+        label.layer.shadowOffset = CGSizeMake(0.0, textScale);
+    }
+
+    [self setSymbol:@"backward.fill" onButton:_previousButton pointSize:10.0 * textScale];
+    [self setSymbol:@"forward.fill" onButton:_nextButton pointSize:10.0 * textScale];
+    [self setSymbol:(_playing ? @"pause.fill" : @"play.fill")
+           onButton:_toggleButton pointSize:13.0 * textScale];
+
+    [self rebuildLyricAttributedText];
+}
+
+- (void)setSymbol:(NSString *)symbol onButton:(UIButton *)button pointSize:(CGFloat)pointSize {
+    [button setImage:PGCardSymbol(symbol, pointSize, UIFontWeightSemibold) forState:UIControlStateNormal];
 }
 
 @end
 
-/// 承载胶囊的容器。窗口尺寸一变（旋转）UIKit 就会同步回调 layoutSubviews，
-/// 胶囊在旋转动画的每一帧都贴在正确的边上，不会出现"先错位、等下一次轮询才跳回来"的闪动。
+/// 承载卡片的容器。窗口尺寸一变（旋转）UIKit 就会同步回调 layoutSubviews，
+/// 卡片在旋转动画的每一帧都贴在正确的边上，不会出现"先错位、等下一次轮询才跳回来"的闪动。
 @class PGLandscapeBar;
 
 @interface PGLandscapeBar (PGPlacement)
-- (void)placeBarInBounds:(CGRect)bounds;
+- (void)placeCardInBounds:(CGRect)bounds;
 @end
 
 @interface PGLandscapeHostView : UIView
@@ -819,15 +1313,19 @@ static const CGFloat PGBackdropBlurRadius = 42.0;
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    [self.bar placeBarInBounds:self.bounds];
+    [self.bar placeCardInBounds:self.bounds];
 }
 
 @end
 
-/// 显示 + 只放行胶囊和面板上的触摸，其它位置全部穿透给底下的游戏。
+/// 显示 + 只放行卡片上的触摸，其它位置全部穿透给底下的游戏。
+///
+/// 1.1-38 起不再有"点面板外面收起"这条路：实机上那条链路（手势、命中测试、
+/// 透明全屏拦截层、sendEvent 落点判定）反复验证都拿不到触摸事件 ——
+/// 日志里连一条痕迹都没有，说明事件在进窗口之前就被别的进程窗口分走了。
+/// 现在播放控制默认隐藏，长按整张卡片展开，松手 3 秒后自动收起。
 @interface PGLandscapeBarWindow : UIWindow
-@property (nonatomic, weak, nullable) UIView *barHitArea;
-@property (nonatomic, weak, nullable) UIView *panelHitArea;
+@property (nonatomic, weak, nullable) UIView *cardHitArea;
 @end
 
 @implementation PGLandscapeBarWindow
@@ -841,17 +1339,18 @@ static const CGFloat PGBackdropBlurRadius = 42.0;
 }
 
 /// 这个窗口铺满全屏，如果正常参与命中测试会把游戏的触摸全部吃掉。
-/// 只把落在胶囊 / 控制面板里的点交出去，其余返回 nil —— UIKit 会继续往下层窗口投递。
+/// 只把落在卡片里的点交出去，其余返回 nil —— UIKit 会继续往下层窗口投递。
+///
+/// 这里刻意保持"最笨"的写法：让 UIKit 自己做命中测试，再判断结果属于哪个子视图。
+/// 之前几版尝试过“面板展开时无条件兜住触摸”的各种变体，实机上都出现过
+/// 拿不到事件、或者反过来把整屏吃掉的情况，不如老老实实穿透。
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (self.hidden) return nil;
     UIView *hit = [super hitTest:point withEvent:event];
     if (!hit || hit == self) return nil;
 
-    UIView *bar = self.barHitArea;
-    if (bar && !bar.hidden && [hit isDescendantOfView:bar]) return hit;
-
-    UIView *panel = self.panelHitArea;
-    if (panel && !panel.hidden && panel.superview && [hit isDescendantOfView:panel]) return hit;
+    UIView *card = self.cardHitArea;
+    if (card && !card.hidden && [hit isDescendantOfView:card]) return hit;
 
     return nil;
 }
@@ -924,9 +1423,12 @@ static CFTimeInterval PGFrontmostCachedAt = 0.0;
 static CFTimeInterval PGFrontmostRequestedAt = 0.0;
 static BOOL PGFrontmostProbing = NO;
 static CFTimeInterval PGFrontmostProbeStartedAt = 0.0;
-/// 探针线程一旦卡死就永久放弃探测（本次 SpringBoard 生命周期内），
-/// 免得每 0.25 秒往同一个堵死的队列里再塞一个 block。
+/// 探针线程一旦卡死就先停一段时间（不是永久停）。
+/// 1.1-34 之前这里是"本次进程内不再探测"：游戏里某次切换让这一路 XPC 卡了 2.5 秒，
+/// 之后就永远是 Unknown —— 开了白名单的话等于横屏块被永久吞掉（"点了几下横屏就不见了"）。
+/// 现在改成冷却 15 秒后重试一次，卡死的代价只是偶发一次 2.5 秒的等待。
 static BOOL PGFrontmostQueueStuck = NO;
+static CFTimeInterval PGFrontmostStuckAt = 0.0;
 
 /// 探针 1：FBS display layout。只读 currentLayout，不装 transitionHandler
 /// （block 签名对不上会崩），创建一次后复用。
@@ -936,10 +1438,30 @@ static BOOL PGFrontmostQueueStuck = NO;
 /// 回到桌面后 App 元素消失，赢的就是 `com.apple.springboard`，调用方据此判定"在桌面"。
 static NSString *PGFrontmostFromDisplayLayout(void) {
     static id monitor = nil;
-    static BOOL tried = NO;
+    static CFTimeInterval monitorCreatedAt = 0.0;
+    static CFTimeInterval lastLayoutAt = 0.0;
+    static NSInteger rebuildCount = 0;
 
-    if (!tried) {
-        tried = YES;
+    CFTimeInterval now = CACurrentMediaTime();
+
+    // ⚠️ 注销（respring）刚起来时，插件会被很早唤醒一次：那一刻 FrontBoard 还没准备好，
+    // monitor.currentLayout 会一直是 nil —— 而且它"只在有变化时推送"，桌面上什么都不变，
+    // 于是这个 nil 会一直挂到某个 App 启动为止。
+    // 这正是"刚注销、没打开任何 App 时，桌面横过来会冒出横屏块；开个 App 再回桌面就正常"的成因。
+    // 所以：拿不到布局超过 2 秒就换一个新的 monitor（限 10 次，避免极端情况下反复重建）。
+    if (monitor && lastLayoutAt <= 0.0 && now - monitorCreatedAt > 2.0 && rebuildCount < 10) {
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(monitor, @selector(invalidate));
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        monitor = nil;
+        rebuildCount++;
+        PGLog(@"白名单探针: 布局 2 秒没回来，重建 monitor（第 %ld 次）", (long)rebuildCount);
+    }
+
+    if (!monitor) {
+        monitorCreatedAt = now;
         @try {
             Class configClass = NSClassFromString(@"FBSDisplayLayoutMonitorConfiguration");
             Class monitorClass = NSClassFromString(@"FBSDisplayLayoutMonitor");
@@ -970,6 +1492,8 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
         layout = nil;
     }
     if (!layout) return nil;
+    // 布局真的拿到了：记一笔，避免上面那条"重建"逻辑把好好的 monitor 换掉。
+    lastLayoutAt = now;
 
     NSArray *elements = nil;
     @try {
@@ -1075,6 +1599,9 @@ static void PGFrontmostProbeNow(void) {
             PGFrontmostCachedAt = CACurrentMediaTime();
             if (identifier.length > 0 || homeScreen) PGFrontmostEverResolved = YES;
             PGFrontmostProbing = NO;
+            // 这一路成功回来了，说明队列是通的，清掉"卡死"标记。
+            PGFrontmostQueueStuck = NO;
+            PGFrontmostProbeStartedAt = 0.0;
         }
 
         CFTimeInterval now = CACurrentMediaTime();
@@ -1122,7 +1649,14 @@ static PGFrontmostKind PGCurrentFrontmost(NSString **outIdentifier) {
             PGFrontmostProbing = NO;
             PGFrontmostProbeStartedAt = 0.0;
             PGFrontmostQueueStuck = YES;
+            PGFrontmostStuckAt = now;
             justGotStuck = YES;
+        }
+        // 冷却 15 秒后允许再试：卡死的队列自己会恢复，永久放弃等于把功能锁死。
+        if (PGFrontmostQueueStuck && now - PGFrontmostStuckAt > 15.0) {
+            PGFrontmostQueueStuck = NO;
+            PGFrontmostRequestedAt = 0.0;
+            PGLog(@"白名单探针: 冷却 15 秒后重新尝试探测");
         }
         if (!PGFrontmostProbing && !PGFrontmostQueueStuck && now - PGFrontmostRequestedAt > 0.20) {
             PGFrontmostProbing = YES;
@@ -1133,7 +1667,7 @@ static PGFrontmostKind PGCurrentFrontmost(NSString **outIdentifier) {
     }
 
     if (justGotStuck) {
-        PGLog(@"白名单探针: 上一次探测超过 2.5s 未返回，本次启动内不再探测（一律放行）");
+        PGLog(@"白名单探针: 上一次探测超过 2.5s 未返回，暂停 15 秒后重试");
     }
     if (needProbe) {
         dispatch_async(PGFrontmostQueue(), ^{
@@ -1152,13 +1686,24 @@ static BOOL PGFrontmostHasEverResolved(void) {
     }
 }
 
+/// 本进程第一次用到探针的时刻。刚注销/刚重启的那一两秒里，探针必然还没回来（Unknown），
+/// 这段时间用"保持现状"过渡，不要在桌面上闪出一块横屏信息。
+static CFTimeInterval PGFrontmostStartedAt(void) {
+    static CFTimeInterval start = 0.0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        start = CACurrentMediaTime();
+    });
+    return start;
+}
+
 
 #pragma mark - 横屏常驻块
 
-@interface PGLandscapeBar ()
+@interface PGLandscapeBar () <UIGestureRecognizerDelegate>
 
 @property (nonatomic, strong, nullable) PGLandscapeBarWindow *window;
-@property (nonatomic, strong, nullable) PGLandscapeBarView *bar;
+@property (nonatomic, strong, nullable) PGLandscapeMusicCard *card;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
 @property (nonatomic, strong, nullable) NSTimer *suspendTimer;
 @property (nonatomic, strong, nullable) CMMotionManager *motionManager;
@@ -1176,9 +1721,9 @@ static BOOL PGFrontmostHasEverResolved(void) {
 /// 上次排版是不是"贴顶边"（否则贴底边）。用于判断是否需要重排。
 @property (nonatomic, assign) BOOL laidOutAnchorAtTop;
 @property (nonatomic, assign) CGSize laidOutScreenSize;
-/// 当前胶囊尺寸。量一次缓存起来，旋转动画期间每帧重排只做几何计算，不重复量文字。
-@property (nonatomic, assign) CGFloat barLength;
-@property (nonatomic, assign) CGFloat barThickness;
+/// 当前卡片尺寸。量一次缓存起来，旋转动画期间每帧重排只做几何计算。
+@property (nonatomic, assign) CGFloat cardLength;
+@property (nonatomic, assign) CGFloat cardThickness;
 /// 当前"哪一侧长边朝上"。容器 layoutSubviews 重排时用它，不必重新读重力。
 @property (nonatomic, assign) BOOL anchorLeftEdgeUp;
 /// 进入横屏的时间戳，用于"稳定 150ms 再显示"。
@@ -1203,20 +1748,15 @@ static BOOL PGFrontmostHasEverResolved(void) {
 @property (nonatomic, copy) NSString *resolvedSource;
 @property (nonatomic, copy, nullable) NSString *lastSnapshot;
 
-/// 点一下胶囊弹出的播放控制面板。
-@property (nonatomic, strong, nullable) PGLandscapeControlPanel *panel;
-@property (nonatomic, assign) BOOL panelVisible;
-@property (nonatomic, strong, nullable) NSTimer *panelTimer;
+/// 横屏时唯一的那张卡片（状态行 / 歌曲区 / 控制区）。
+@property (nonatomic, assign) BOOL controlsVisible;
+@property (nonatomic, strong, nullable) NSTimer *controlsTimer;
+/// 双指捏合卡片时的临时倍数（0 = 没在捏，用偏好里的值）。松手后写回偏好再清零。
+@property (nonatomic, assign) CGFloat liveCardScale;
+/// 捏合开始那一刻的倍数，作为本次缩放的基准（捏合是相对量）。
+@property (nonatomic, assign) CGFloat pinchStartScale;
 /// 是否已经在监听系统"正在播放"。
 @property (nonatomic, assign) BOOL musicMonitoring;
-/// 音乐区当前生效的可见状态，以及"待生效"的候选状态。
-@property (nonatomic, assign) BOOL musicAppliedVisible;
-@property (nonatomic, assign) BOOL musicHasApplied;
-@property (nonatomic, assign) BOOL musicPendingVisible;
-@property (nonatomic, assign) CFTimeInterval musicPendingSince;
-/// 最新一次算出来的"应不应该显示音乐区"。轮询每拍都重新算一遍，
-/// 不能只在 onChange 里算 —— 系统不一定发通知，那样"待生效"永远等不到下一拍。
-@property (nonatomic, assign) BOOL musicDesiredVisible;
 /// 上一次因为"不在白名单"被隐藏的 App，用来只打一次日志（每拍都打会刷爆文件）。
 @property (nonatomic, copy, nullable) NSString *lastBlockedApp;
 /// 探针这一拍没拿到前台 App 的起始时刻。用来做 0.45s 的过渡防抖：
@@ -1295,9 +1835,8 @@ static BOOL PGFrontmostHasEverResolved(void) {
     [nowPlaying startMonitoring];
 }
 
-/// 决定胶囊里要不要带音乐信息。
-/// 判定条件：开关打开 + 确实在播 + 有歌名/歌手 + 播放的 App 不是当前前台 App
-/// （前台自己在放视频/音乐时不该再显示一遍，那正是全屏看片会误弹的原因）。
+/// 把系统"正在播放"直接灌给卡片。卡片是常驻的，不再需要"出现 / 消失"的可见性判定 ——
+/// 没在放歌就显示「未播放」，封面区照常在，文案由卡片自己兜。
 - (void)applyNowPlaying:(PGNowPlaying *)item {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1305,192 +1844,175 @@ static BOOL PGFrontmostHasEverResolved(void) {
         });
         return;
     }
-    if (!self.bar) return;
+    if (!self.card) return;
 
-    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
-    NSString *playingApp = item.bundleIdentifier;
-    NSString *frontApp = item.frontmostBundleIdentifier;
-    BOOL inBackground = playingApp.length == 0 || frontApp.length == 0 ||
-                        ![playingApp isEqualToString:frontApp];
-    BOOL hasText = item.title.length > 0 || item.artist.length > 0;
-    self.musicDesiredVisible = preferences.landscapeMusic && item.isPlaying && hasText && inBackground;
-
-    [self evaluateMusicVisibilityWithItem:item];
+    [self.card updateTitle:item.title
+                    artist:item.artist
+                   playing:item.isPlaying
+                   elapsed:item.elapsed
+                  duration:item.duration
+               artworkData:item.artworkData
+                canOpenApp:item.bundleIdentifier.length > 0];
 }
 
-/// 把"想要的可见状态"按 PGLandscapeMusicDebounce 稳定一段时间后落到胶囊上。
-/// 必须能被外部按拍调用（pollTick），否则状态一旦不再变化就再没人推进它 ——
-/// 表现就是"明明在放歌，歌名永远不出来"。
-- (void)evaluateMusicVisibilityWithItem:(PGNowPlaying *)item {
-    BOOL desired = self.musicDesiredVisible;
+#pragma mark 播放控制区的展开 / 收起
 
-    // 稳定化：这些探针（是否在播 / 播放的是哪个 App / 前台是哪个 App）在切前台、App 切换、
-    // 锁屏的瞬间会有一两次瞬时失准。直接跟着变，胶囊就会一会儿有歌名一会儿没有，
-    // 宽度来回跳 —— 用户看到的就是"一直闪"。新状态必须稳定 PGLandscapeMusicDebounce 才生效。
-    CFTimeInterval now = CACurrentMediaTime();
-    if (!self.musicHasApplied) {
-        self.musicHasApplied = YES;
-        self.musicAppliedVisible = desired;
-        self.musicPendingSince = 0.0;
-    } else if (desired == self.musicAppliedVisible) {
-        self.musicPendingSince = 0.0;
-    } else if (self.musicPendingSince <= 0.0 || self.musicPendingVisible != desired) {
-        self.musicPendingVisible = desired;
-        self.musicPendingSince = now;
-    } else if (now - self.musicPendingSince >= PGLandscapeMusicDebounce) {
-        self.musicAppliedVisible = desired;
-        self.musicPendingSince = 0.0;
-        PGLog(@"音乐区%@ (playing=%d app=%@ front=%@)",
-              desired ? @"显示" : @"收起", item.isPlaying,
-              item.bundleIdentifier ?: @"-", item.frontmostBundleIdentifier ?: @"-");
+/// 长按整张卡片展开控制区。手势绑在卡片上（不是歌词上），按卡片哪儿都算。
+- (void)handleCardLongPress:(UILongPressGestureRecognizer *)recognizer {
+    switch (recognizer.state) {
+        case UIGestureRecognizerStateBegan:
+            // 长按之后系统还会补一次 tap，抑制掉，免得刚展开就被自己收起。
+            self.suppressTapUntil = CACurrentMediaTime() + 0.5;
+            [self showControls];
+            break;
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed:
+            // 松手后留 3 秒，够点上一首 / 播放 / 下一首；按按钮会重新计时。
+            [self scheduleControlsHide];
+            break;
+        default:
+            break;
     }
-
-    BOOL visible = self.musicAppliedVisible;
-    [self.bar setMusicVisible:visible
-                        title:item.title
-                       artist:item.artist
-                      playing:item.isPlaying];
-    if (visible) {
-        [self syncPanelWithNowPlaying:item];
-    }
-    // 面板不跟着音乐区一起收。用户点开之后就该由用户（再点一次）或 6 秒超时来收起；
-    // 后台播放状态抖一下就把面板收掉，表现就是"点了没反应 / 闪一下就没了"
-    // —— 横屏游戏（王者这类）里播放态探针本来就不稳，不能拿它决定面板的生死。
 }
 
-/// 面板要的字段比胶囊多（进度、封面、能不能跳回播放器），统一在这里灌进去。
-- (void)syncPanelWithNowPlaying:(PGNowPlaying *)item {
-    if (!self.panel) return;
-    [self.panel updateTitle:item.title
-                     artist:item.artist
-                    playing:item.isPlaying
-                    elapsed:item.elapsed
-                   duration:item.duration
-                artworkData:item.artworkData
-                 canOpenApp:item.bundleIdentifier.length > 0];
+/// 单指点卡片：展开状态下收回控制区；收起状态下什么都不做（避免误触把卡片弄没）。
+- (void)handleCardTap:(UITapGestureRecognizer *)recognizer {
+    if (CACurrentMediaTime() < self.suppressTapUntil) return;
+    if (!self.card) return;
+    // 点在封面上 = 跳回播放器；其它位置：展开状态下收回控制区，收起状态下什么都不做。
+    CGPoint point = [recognizer locationInView:self.card];
+    if ([self.card handleTapAtPoint:point]) return;
+    if (self.controlsVisible) [self hideControls];
 }
 
-/// 面板里有没有内容可展示。
-/// ⚠️ 这个条件现在**只用来决定文案**，不再是能不能弹面板的门槛。
-/// 横屏游戏里 MediaRemote 的探针很不稳（有时连标题都取不到），只要拿它当门槛，
-/// 用户就会遇到"点一下完全没反应" —— 而他要的其实是"能操控控制台"。
-/// 面板里没有曲目时显示"未在播放"，播放/暂停、上一首、下一首照样能发命令。
-- (BOOL)hasPlayableMedia {
-    if (self.bar.musicVisible) return YES;
-    PGNowPlaying *item = PGNowPlaying.sharedInstance;
-    return item.title.length > 0 || item.artist.length > 0;
-}
-
-- (void)handleBarTap:(UITapGestureRecognizer *)recognizer {
-    PGLog(@"面板: 收到点击（panelVisible=%d 音乐区=%d 空间=%.0fx%.0f）",
-          self.panelVisible, self.bar.musicVisible,
-          CGRectGetWidth(self.window.bounds), CGRectGetHeight(self.window.bounds));
-    if (CACurrentMediaTime() < self.suppressTapUntil) return;   // 长按刚开过面板，别被同一串触摸关掉
-    if (self.panelVisible) {
-        if (!self.panel.hidden) {
-            [self hidePanel];      // 面板确实在屏上 → 这一下就是"收起"
-            return;
-        }
-        // 面板已经不可见、状态却还挂着 visible：一旦有这个死状态，之后每次点击都只会
-        // 走到 hidePanel 而什么都看不到 —— 用户眼里就是"怎么点都没反应"。这里自愈。
-        self.panelVisible = NO;
-        PGLog(@"面板: 状态自愈（panelVisible=1 但面板已隐藏）");
-    }
-    if (![self hasPlayableMedia]) {
-        PGLog(@"面板: 没有媒体信息，仍然弹出（内容显示为未在播放）");
-    }
-    [self showPanel];
-}
-
-- (void)handleBarLongPress:(UILongPressGestureRecognizer *)recognizer {
-    if (recognizer.state != UIGestureRecognizerStateBegan) return;
-    PGLog(@"面板: 收到长按（panelVisible=%d 音乐区=%d）", self.panelVisible, self.bar.musicVisible);
-    if (self.panelVisible) return;
-    if (![self hasPlayableMedia]) {
-        PGLog(@"面板: 长按且没有媒体信息，仍然弹出（内容显示为未在播放）");
-    }
-    // 长按结束后系统还会补一次 tap，抑制掉它，否则面板开了立刻又被关掉 —— 看着就是"闪"。
-    self.suppressTapUntil = CACurrentMediaTime() + 0.7;
-    [self showPanel];
-}
-
-- (void)showPanel {
-    if (!self.panel || self.panelVisible) return;
-    if (!self.window) {
-        PGLog(@"面板: 没有窗口，忽略");
+/// 双指点击：横屏双手握持时食指常压在卡片附近，双指点比长按更省事。
+- (void)handleCardTwoFingerTap:(UITapGestureRecognizer *)recognizer {
+    if (self.controlsVisible) {
+        [self scheduleControlsHide];
         return;
     }
+    self.suppressTapUntil = CACurrentMediaTime() + 0.4;
+    [self showControls];
+    [self scheduleControlsHide];
+}
 
-    PGNowPlaying *nowPlaying = PGNowPlaying.sharedInstance;
-    [self syncPanelWithNowPlaying:nowPlaying];
+/// 按钮上的触摸不交给卡片手势：否则按了"下一首"之后，卡片的 tap 还会跟着把控制区收起来。
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    UIView *view = touch.view;
+    while (view && view != self.card) {
+        if ([view isKindOfClass:UIControl.class]) return NO;
+        view = view.superview;
+    }
+    return YES;
+}
 
-    self.panelVisible = YES;
-    self.panel.hidden = NO;
-    self.panel.alpha = 0.0;
-    [self.panel.superview bringSubviewToFront:self.panel];
+/// 双指捏合直接改卡片大小（跟手），松手写回设置里那个滑块。
+- (void)handleCardPinch:(UIPinchGestureRecognizer *)recognizer {
+    if (!self.card) return;
     CGRect space = self.window.bounds;
+    if (CGRectGetWidth(space) <= 0.0 || CGRectGetHeight(space) <= 0.0) return;
 
-    // 窗口尺寸真的是 0（场景刚失效）就别弹了。不能留一个 panelVisible=YES 的死状态，
-    // 否则下一次点击只会把它 hide 掉，等于点了没反应。
-    if (CGRectGetWidth(space) <= 0.0 || CGRectGetHeight(space) <= 0.0) {
-        self.panelVisible = NO;
-        self.panel.hidden = YES;
-        self.panel.alpha = 1.0;
-        PGLog(@"面板: 窗口尺寸无效（%.0fx%.0f），不弹",
-              CGRectGetWidth(space), CGRectGetHeight(space));
-        return;
+    switch (recognizer.state) {
+        case UIGestureRecognizerStateBegan:
+            self.pinchStartScale = self.liveCardScale > 0.0 ? self.liveCardScale : PGCardScaleValue();
+            // 捏的时候别让自动收起计时在半路把控制区抢走。
+            [self.controlsTimer invalidate];
+            self.controlsTimer = nil;
+            break;
+        case UIGestureRecognizerStateChanged: {
+            CGFloat target = self.pinchStartScale * recognizer.scale;
+            if (!isfinite(target) || target <= 0.0) return;
+            self.liveCardScale = MAX(0.7, MIN(2.2, target));
+            [self layoutCardLeftEdgeUp:self.anchorLeftEdgeUp];
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled: {
+            CGFloat finalScale = self.liveCardScale > 0.0 ? self.liveCardScale : self.pinchStartScale;
+            self.liveCardScale = 0.0;
+            [self persistCardScale:finalScale];
+            [self layoutCardLeftEdgeUp:self.anchorLeftEdgeUp];
+            [self scheduleControlsHide];
+            break;
+        }
+        default:
+            break;
     }
-
-    [self placePanelInSpace:space];
-
-    BOOL rotated = CGRectGetWidth(space) <= CGRectGetHeight(space);
-
-    [UIView animateWithDuration:0.16
-                          delay:0.0
-                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
-                     animations:^{
-        self.panel.alpha = 1.0;
-    } completion:nil];
-
-    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
-    if (preferences.vibrationFeedback) AudioServicesPlaySystemSound(1519);
-    [self schedulePanelHide];
-    PGLog(@"面板: 弹出 frame=%@ 空间=%.0fx%.0f 旋转补偿=%d 标题=%@",
-          NSStringFromCGRect(self.panel.frame), CGRectGetWidth(space), CGRectGetHeight(space),
-          rotated, nowPlaying.title ?: @"-");
 }
 
-- (void)hidePanel {
-    [self.panelTimer invalidate];
-    self.panelTimer = nil;
-    if (!self.panelVisible) return;
-    self.panelVisible = NO;
-    [self.panel.layer removeAllAnimations];
-    self.panel.hidden = YES;
-    self.panel.alpha = 1.0;
+/// 把双指调出来的大小写回偏好，设置页那个滑块下次打开就是这个值。
+- (void)persistCardScale:(CGFloat)scale {
+    if (!isfinite(scale) || scale <= 0.0) return;
+    scale = MAX(0.7, MIN(2.2, scale));
+    CFPreferencesSetAppValue(CFSTR("LandscapeCardScale"),
+                             (__bridge CFPropertyListRef)@(scale),
+                             (__bridge CFStringRef)PGPreferencesDomain);
+    CFPreferencesAppSynchronize((__bridge CFStringRef)PGPreferencesDomain);
+    PGLog(@"卡片: 双指缩放已保存，倍数 %.2f（约 %.0fx%.0f）",
+          scale, PGCardDesignWidth * scale, PGCardCollapsedHeight * scale);
 }
 
-/// 面板不点也会自己收起，免得挡住游戏画面。
-- (void)schedulePanelHide {
-    [self.panelTimer invalidate];
+- (void)showControls {
+    if (!self.card || self.controlsVisible || !self.window) return;
+    [self.controlsTimer invalidate];
+    self.controlsTimer = nil;
+    self.controlsVisible = YES;
+    [self.card setControlsVisible:YES animated:YES];
+    [self animateCardLayout];
+    if (PerfectGrabberPreferences.sharedPreferences.vibrationFeedback) {
+        AudioServicesPlaySystemSound(1519);
+    }
+    PGLog(@"卡片: 展开播放控制");
+}
+
+- (void)hideControls {
+    [self.controlsTimer invalidate];
+    self.controlsTimer = nil;
+    if (!self.controlsVisible) return;
+    self.controlsVisible = NO;
+    [self.card setControlsVisible:NO animated:YES];
+    [self animateCardLayout];
+    PGLog(@"卡片: 收起播放控制");
+}
+
+/// 松手后自动收起控制区。任何一次按按钮都会重新计时，正在操作时不会被收走。
+- (void)scheduleControlsHide {
+    [self.controlsTimer invalidate];
+    self.controlsTimer = nil;
+    if (!self.controlsVisible) return;
     __weak typeof(self) weakSelf = self;
-    NSTimer *timer = [NSTimer timerWithTimeInterval:6.0
+    NSTimer *timer = [NSTimer timerWithTimeInterval:PGCardControlsGraceSeconds
                                            repeats:NO
                                              block:^(NSTimer *fireTimer) {
-        [weakSelf hidePanel];
+        [weakSelf hideControls];
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
-    self.panelTimer = timer;
+    self.controlsTimer = timer;
+}
+
+/// 卡片高度变了（展开 / 收起），带动画重排一次。
+- (void)animateCardLayout {
+    if (!self.window || !self.card) return;
+    [UIView animateWithDuration:0.20
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        [self placeCardInBounds:self.window.bounds];
+    } completion:nil];
 }
 
 - (void)sendMediaCommand:(PGMediaCommand)command {
     [PGNowPlaying.sharedInstance sendCommand:command];
-    PerfectGrabberPreferences *preferences = PerfectGrabberPreferences.sharedPreferences;
-    if (preferences.vibrationFeedback) AudioServicesPlaySystemSound(1519);
-    [self schedulePanelHide];
+    if (PerfectGrabberPreferences.sharedPreferences.vibrationFeedback) {
+        AudioServicesPlaySystemSound(1519);
+    }
+    // 按按钮说明还在用，把自动收起往后推。
+    [self scheduleControlsHide];
 }
 
-/// 面板右下角那个按钮：直接跳到正在放歌的 App。
+/// 点封面：直接跳到正在放歌的 App。
 - (void)openNowPlayingApplication {
     NSString *bundleIdentifier = PGNowPlaying.sharedInstance.bundleIdentifier;
     if (bundleIdentifier.length == 0) return;
@@ -1502,11 +2024,10 @@ static BOOL PGFrontmostHasEverResolved(void) {
         SEL selector = @selector(openApplicationWithBundleID:);
         if (!workspace || ![workspace respondsToSelector:selector]) return;
         ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, selector, bundleIdentifier);
-        PGLog(@"面板: 跳转到 %@", bundleIdentifier);
+        PGLog(@"卡片: 跳转到 %@", bundleIdentifier);
     } @catch (__unused NSException *exception) {
-        PGLog(@"面板: 跳转 %@ 抛异常", bundleIdentifier);
+        PGLog(@"卡片: 跳转 %@ 抛异常", bundleIdentifier);
     }
-    [self hidePanel];
 }
 
 - (void)setSuspended:(BOOL)suspended {
@@ -1526,6 +2047,8 @@ static BOOL PGFrontmostHasEverResolved(void) {
     _suspended = suspended;
 
     if (suspended) {
+        // 系统下拉面板自己会显示时间电量，控制区先收起来。
+        [self hideControls];
         // 兜底：_willDismiss 未必总被调用，一旦漏掉这个标记就会永久暂停、横竖屏都不显示。
         __weak typeof(self) weakSelf = self;
         NSTimer *timer = [NSTimer timerWithTimeInterval:3.0
@@ -1696,8 +2219,8 @@ static BOOL PGFrontmostHasEverResolved(void) {
         [self startMotionUpdatesIfNeeded];
     }
 
-    // 音乐区每拍重新判一次：MediaRemote 的通知不一定来（后台播放尤其容易漏），
-    // 只靠 onChange 的话"待生效"状态永远等不到下一次判定，歌名就再也出不来。
+    // 音乐每拍重新灌一次：MediaRemote 的通知不一定来（后台播放尤其容易漏），
+    // 只靠 onChange 的话歌名 / 进度可能一直停在旧值。卡片内部会做去重，不会白刷 UI。
     if (self.active) {
         [self applyNowPlaying:PGNowPlaying.sharedInstance];
     }
@@ -1788,7 +2311,7 @@ static BOOL PGFrontmostHasEverResolved(void) {
         [self noteToggleAt:now];
     }
 
-    [self showBarLeftEdgeUp:leftEdgeUp];
+    [self showCardLeftEdgeUp:leftEdgeUp];
     [self logSnapshotShown:YES note:[@"show/" stringByAppendingString:source]];
 }
 
@@ -1854,30 +2377,48 @@ static BOOL PGFrontmostHasEverResolved(void) {
     // 探针链路断过又恢复不了的兜底：从进程启动到现在一次都没成功 → 当成不可用。
     BOOL everResolved = PGFrontmostHasEverResolved();
 
-    // ② 这一拍没拿到（过渡态）。开了白名单时才升级成"桌面"：
-    //    保持现状 0.45 秒，持续拿不到才隐藏 —— 从 App 退回桌面的那一两拍不会让块闪一下。
-    //    没开白名单时按老逻辑放行，免得探针噪点把全局模式的块吞掉。
+    // ② 这一拍没拿到。
+    //    从没成功解析过（刚注销/刚重启的那一两秒）：保持现状不动 —— 默认是隐藏，
+    //    所以不会在桌面上冒出来；等探针回来（通常 <1 秒）再按真实前台判断。
+    //    8 秒还解析不出来就认定探针在本机不可用，放行（宁可全局显示，也别把功能整个吞掉）。
+    //
+    //    ⚠️ 这一段以前是"没开白名单就直接放行"，于是刚注销时桌面上横屏会冒出一块
+    //    （1.1-34 用户反馈），打开任意 App 触发一次布局更新后就又正常了。现在统一按上面的规则处理。
     if (kind == PGFrontmostKindUnknown || frontmost.length == 0) {
-        if (!filtering) {
-            self.frontmostMissingSince = 0.0;
-            self.lastBlockedApp = nil;
-            return YES;
-        }
         if (!everResolved) {
-            // 真正的不可用：宁可全局显示，也不要把功能整个吞掉。
-            self.lastBlockedApp = @"<probe>";
+            // 注销 / 开机早期：FBS 与 LS 都是空的，实测要 9 秒左右才第一次拿到前台 App。
+            // 这段窗口期一律隐藏 —— 以前这里是"8 秒后放行"，于是注销后桌面横屏会冒出一块，
+            // 等到探针就绪才消失（1.1-36 反馈）。白名单模式下宁可晚几秒显示，也不能在桌面上乱冒。
+            CFTimeInterval elapsed = CACurrentMediaTime() - PGFrontmostStartedAt();
+            if (elapsed < 60.0) {
+                self.frontmostMissingSince = 0.0;
+                if (![self.lastBlockedApp isEqualToString:@"<boot>"]) {
+                    self.lastBlockedApp = @"<boot>";
+                    PGLog(@"前台: 探针尚未就绪（已 %.0fs，注销/开机早期）→ 隐藏横屏块", elapsed);
+                }
+                return NO;
+            }
+            // 整整一分钟都没成功过：认定本机探针不可用，退回全局显示，
+            // 否则白名单模式会让整个功能静默失效。
+            if (![self.lastBlockedApp isEqualToString:@"<probe>"]) {
+                self.lastBlockedApp = @"<probe>";
+                PGLog(@"前台: 探针 60s 内从未成功，判定不可用 → 放行（全局显示）");
+            }
             self.frontmostMissingSince = 0.0;
             return YES;
         }
+        // 已经成功过：这一拍拿不到 = 过渡态，或者探针刚好卡住了。
+        // 给 2.5 秒的宽限（正好等于探针的"卡死判定"阈值），期间的抖动不影响显示；
+        // 真的回到桌面时走的是 ① 那条（布局会明确报 SpringBoard），不需要靠这里兜。
         CFTimeInterval now = CACurrentMediaTime();
         if (self.frontmostMissingSince <= 0.0) {
             self.frontmostMissingSince = now;
             return self.visible;
         }
-        if (now - self.frontmostMissingSince < 0.45) return self.visible;
+        if (now - self.frontmostMissingSince < 2.5) return self.visible;
         if (![self.lastBlockedApp isEqualToString:@"<home>"]) {
             self.lastBlockedApp = @"<home>";
-            PGLog(@"前台: 持续 0.45s 没有前台 App（桌面/锁屏）→ 隐藏横屏块");
+            PGLog(@"前台: 持续 2.5s 拿不到前台 App（探针无响应）→ 隐藏横屏块");
         }
         return NO;
     }
@@ -1940,34 +2481,34 @@ static BOOL PGFrontmostHasEverResolved(void) {
 
 #pragma mark 显示
 
-- (void)showBarLeftEdgeUp:(BOOL)leftEdgeUp {
+- (void)showCardLeftEdgeUp:(BOOL)leftEdgeUp {
     if (![self ensureWindowAndSubviews]) return;
     if (!self.updating) {
-        [self.bar startUpdating];
+        [self.card startTicking];
         self.updating = YES;
     }
     self.anchorLeftEdgeUp = leftEdgeUp;
-    [self layoutBarLeftEdgeUp:leftEdgeUp];
+    [self layoutCardLeftEdgeUp:leftEdgeUp];
     self.window.hidden = NO;
 
     if (!self.visible) {
-        self.bar.hidden = NO;
+        self.card.hidden = NO;
         // 只有"第一次出现"或"确实藏了一会儿"才淡入。若是在几百毫秒内又显回来，
         // 再来一次淡入就是肉眼可见的闪 —— 直接给满透明度。
         BOOL longGap = !self.appearedOnce ||
                        (self.lastHideTime > 0.0 && CACurrentMediaTime() - self.lastHideTime > 1.2);
         if (longGap) {
-            self.bar.alpha = 0.0;
+            self.card.alpha = 0.0;
             [UIView animateWithDuration:PGLandscapeFadeInDuration
                                   delay:0.0
                                 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
                              animations:^{
-                self.bar.alpha = 1.0;
+                self.card.alpha = 1.0;
             } completion:nil];
             self.appearedOnce = YES;
         } else {
-            [self.bar.layer removeAllAnimations];
-            self.bar.alpha = 1.0;
+            [self.card.layer removeAllAnimations];
+            self.card.alpha = 1.0;
         }
     }
     self.lastShowTime = CACurrentMediaTime();
@@ -1990,18 +2531,18 @@ static BOOL PGFrontmostHasEverResolved(void) {
     }
     if (!window) return NO;
     // 不要手动设 frame：场景窗口的 frame 由系统维护，横竖屏切换时会被自动改成 932x430 / 430x932，
-    // 手动写成竖屏尺寸会把胶囊算到屏幕外。
+    // 手动写成竖屏尺寸会把卡片算到屏幕外。
     if (!scene) window.frame = base;
     // 必须远高于普通 App 窗口：全屏视频时前台 App 的层级很高。
     // 系统自带 HUD 都是这个量级，照抄才不会"窗口建好了但看不见"。
     window.windowLevel = UIWindowLevelAlert + 1000000.0;
     window.backgroundColor = UIColor.clearColor;
-    // 窗口本身要收触摸（胶囊 / 面板），由 hitTest 保证其它位置全部穿透。
+    // 窗口本身要收触摸（卡片），由 hitTest 保证其它位置全部穿透。
     window.userInteractionEnabled = YES;
     window.accessibilityElementsHidden = YES;
     window.hidden = YES;
 
-    // 根视图换成自定义容器：它随窗口一起变尺寸，旋转动画每一帧都会回调 layoutSubviews 重排胶囊。
+    // 根视图换成自定义容器：它随窗口一起变尺寸，旋转动画每一帧都会回调 layoutSubviews 重排卡片。
     PGLandscapeHostView *host = [[PGLandscapeHostView alloc] initWithFrame:window.bounds];
     host.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     host.backgroundColor = UIColor.clearColor;
@@ -2012,45 +2553,52 @@ static BOOL PGFrontmostHasEverResolved(void) {
     controller.view = host;
     window.rootViewController = controller;
 
-    PGLandscapeBarView *bar = [[PGLandscapeBarView alloc] initWithFrame:CGRectZero];
-    bar.hidden = YES;
+    PGLandscapeMusicCard *card = [[PGLandscapeMusicCard alloc] initWithFrame:CGRectZero];
+    card.hidden = YES;
+
+    // 手势全部绑在整张卡片上 —— 按封面、歌名、歌词、空白处都算，不存在"只有歌词能长按"。
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self
-                                                                         action:@selector(handleBarTap:)];
-    [bar addGestureRecognizer:tap];
-    // 长按也能唤出播放面板（和点一下等价，按住不放更不容易误触）。
+                                                                        action:@selector(handleCardTap:)];
+    tap.delegate = self;
+    [card addGestureRecognizer:tap];
+
     UILongPressGestureRecognizer *longPress =
-        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleBarLongPress:)];
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleCardLongPress:)];
     longPress.minimumPressDuration = 0.35;
-    longPress.allowableMovement = 14.0;
-    [bar addGestureRecognizer:longPress];
-    [host addSubview:bar];
+    longPress.allowableMovement = 20.0;
+    longPress.cancelsTouchesInView = NO;
+    longPress.delegate = self;
+    [card addGestureRecognizer:longPress];
 
-    PGLandscapeControlPanel *panel = [[PGLandscapeControlPanel alloc] initWithFrame:CGRectZero];
-    panel.hidden = YES;
+    // 双指点击：横屏双手握持时食指常压在卡片附近，双指点比长按更省事
+    //（单指 tap 要求 touches == 1，两根手指落下时它直接判失败，两者不冲突）。
+    UITapGestureRecognizer *twoFingerTap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleCardTwoFingerTap:)];
+    twoFingerTap.numberOfTouchesRequired = 2;
+    twoFingerTap.delegate = self;
+    [card addGestureRecognizer:twoFingerTap];
+
+    // 双指捏合直接改大小（松手写回设置里那个倍数，滑块那边同步保留）。
+    UIPinchGestureRecognizer *pinch =
+        [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(handleCardPinch:)];
+    pinch.delegate = self;
+    [card addGestureRecognizer:pinch];
+
     __weak typeof(self) weakSelf = self;
-    panel.onPrevious = ^{ [weakSelf sendMediaCommand:PGMediaCommandPrevious]; };
-    panel.onToggle = ^{ [weakSelf sendMediaCommand:PGMediaCommandTogglePlayPause]; };
-    panel.onNext = ^{ [weakSelf sendMediaCommand:PGMediaCommandNext]; };
-    panel.onOpenApplication = ^{ [weakSelf openNowPlayingApplication]; };
-    [host addSubview:panel];
+    card.onPrevious = ^{ [weakSelf sendMediaCommand:PGMediaCommandPrevious]; };
+    card.onToggle = ^{ [weakSelf sendMediaCommand:PGMediaCommandTogglePlayPause]; };
+    card.onNext = ^{ [weakSelf sendMediaCommand:PGMediaCommandNext]; };
+    card.onOpenApplication = ^{ [weakSelf openNowPlayingApplication]; };
+    [host addSubview:card];
 
-    window.barHitArea = bar;
-    window.panelHitArea = panel;
-
-    // 歌名长短变化会改变胶囊宽度，通知宿主立刻重排（否则要等下一次方向轮询）。
-    bar.contentWidthDidChange = ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf || !strongSelf.visible) return;
-        strongSelf.needsResize = YES;
-        [strongSelf layoutBarLeftEdgeUp:strongSelf.anchorLeftEdgeUp];
-    };
+    window.cardHitArea = card;
 
     self.window = window;
-    self.bar = bar;
-    self.panel = panel;
+    self.card = card;
+    self.controlsVisible = NO;
     self.laidOut = NO;
-    self.barLength = 0.0;
-    self.barThickness = 0.0;
+    self.cardLength = 0.0;
+    self.cardThickness = 0.0;
 
     // 窗口刚建好时音乐可能已经在放了，先把当前状态同步进来。
     [self applyNowPlaying:PGNowPlaying.sharedInstance];
@@ -2061,128 +2609,71 @@ static BOOL PGFrontmostHasEverResolved(void) {
     return YES;
 }
 
-- (void)layoutBarLeftEdgeUp:(BOOL)leftEdgeUp {
-    if (!self.window || !self.bar) return;
-
+- (void)layoutCardLeftEdgeUp:(BOOL)leftEdgeUp {
+    if (!self.window || !self.card) return;
     CGRect space = self.window.bounds;
+    if (CGRectGetWidth(space) <= 0.0 || CGRectGetHeight(space) <= 0.0) return;
+
+    self.anchorLeftEdgeUp = leftEdgeUp;
+    self.laidOut = YES;
+    self.laidOutLeftEdgeUp = leftEdgeUp;
+    self.laidOutScreenSize = space.size;
+    [self placeCardInBounds:space];
+}
+
+/// 卡片尺寸：宽度 = 设计稿 320 × 倍数（受屏幕可用宽度收），高度按展开 / 收起取比例。
+/// 纯算术，不量文字 —— 所以旋转动画里每帧调用也不心疼。
+- (CGSize)cardSizeForSpace:(CGRect)space {
     CGFloat spaceWidth = CGRectGetWidth(space);
     CGFloat spaceHeight = CGRectGetHeight(space);
-    if (spaceWidth <= 0.0 || spaceHeight <= 0.0) return;
-
-    BOOL landscapeSpace = spaceWidth > spaceHeight;      // 窗口已按横屏铺开
-
-    BOOL sameSpace = self.laidOut &&
-                     self.barLength > 0.0 &&
-                     self.laidOutLeftEdgeUp == leftEdgeUp &&
-                     fabs(self.laidOutScreenSize.width - spaceWidth) < 0.5 &&
-                     fabs(self.laidOutScreenSize.height - spaceHeight) < 0.5;
-    if (sameSpace && !self.needsResize) {
-        // 尺寸没变，只按当前窗口重新摆一次位置（旋转动画中每帧都会走到这里）。
-        [self placeBarInBounds:space];
-        return;
-    }
-
-    // 胶囊的长轴沿着窗口的长边铺开，可用长度取长边。
-    CGFloat inset = PGLandscapeBarEdgeInset;
-    CGFloat available = (landscapeSpace ? spaceWidth : spaceHeight) - 2.0 * inset - 24.0;
-    CGSize size = [self.bar preferredContentSizeForMaxWidth:MAX(80.0, available)];
-    self.barLength = MIN(MAX(size.width, 44.0), MAX(available, 44.0));
-    self.barThickness = MAX(size.height, 20.0);
-
-    self.laidOut = YES;
-    self.needsResize = NO;
-    self.laidOutLeftEdgeUp = leftEdgeUp;
-    self.laidOutScreenSize = CGSizeMake(spaceWidth, spaceHeight);
-
-    // 尺寸变化就在下一帧直接生效（歌名来去已经做过稳定化，不会来回跳，
-    // 也就不需要给宽度做动画 —— 动画里的标签重排反而会有半帧错位）。
-    [self placeBarInBounds:space];
-
-    PGLog(@"排版: 横屏空间=%d 左边缘朝上=%d 空间=%.0fx%.0f 胶囊=%.0fx%.0f",
-          landscapeSpace, leftEdgeUp, spaceWidth, spaceHeight, self.barLength, self.barThickness);
+    BOOL landscapeSpace = spaceWidth > spaceHeight;
+    // 用户视角的可用宽度：横屏坐标系是 spaceWidth，竖屏坐标系（游戏自己转画面）是 spaceHeight。
+    CGFloat available = (landscapeSpace ? spaceWidth : spaceHeight) - 2.0 * PGLandscapeBarEdgeInset - 24.0;
+    // 倍数优先取双指捏合中的临时值（跟手），否则读设置里那个滑块的值。
+    CGFloat scale = self.liveCardScale > 0.0 ? self.liveCardScale : PGCardScaleValue();
+    CGFloat width = MIN(PGCardDesignWidth * scale, MAX(180.0, available));
+    CGFloat ratio = (self.controlsVisible ? PGCardExpandedHeight : PGCardCollapsedHeight) / PGCardDesignWidth;
+    return CGSizeMake(ceil(width), ceil(width * ratio));
 }
 
 /// 只做几何摆放：横屏空间贴顶边居中；万一窗口仍是竖屏基准，就贴"物理朝上"的那条长边并旋转 90°。
 /// 两种分支在同一物理姿态下看起来是同一个位置，所以旋转过程中切换分支不会跳。
-- (void)placeBarInBounds:(CGRect)space {
-    if (!self.bar || self.barLength <= 0.0 || self.barThickness <= 0.0) return;
+- (void)placeCardInBounds:(CGRect)space {
+    if (!self.card) return;
     CGFloat spaceWidth = CGRectGetWidth(space);
     CGFloat spaceHeight = CGRectGetHeight(space);
     if (spaceWidth <= 0.0 || spaceHeight <= 0.0) return;
+
+    CGSize size = [self cardSizeForSpace:space];
+    self.cardLength = size.width;
+    self.cardThickness = size.height;
 
     CGFloat inset = PGLandscapeBarEdgeInset;
-    self.bar.transform = CGAffineTransformIdentity;
-    self.bar.bounds = CGRectMake(0.0, 0.0, self.barLength, self.barThickness);
+    self.card.transform = CGAffineTransformIdentity;
+    self.card.bounds = CGRectMake(0.0, 0.0, size.width, size.height);
 
     if (spaceWidth > spaceHeight) {
-        // 横屏坐标系：y=0 那条边就是用户视角的顶边，胶囊横着躺、居中。
-        self.bar.center = CGPointMake(spaceWidth / 2.0, inset + self.barThickness / 2.0);
+        // 横屏坐标系：y=0 那条边就是用户视角的顶边，卡片贴顶居中，展开时往下长。
+        self.card.center = CGPointMake(spaceWidth / 2.0, inset + size.height / 2.0);
     } else {
-        // 竖屏坐标系（旋转未能同步到这里时）：用户视角的顶边是左右两条长边，胶囊旋转 90° 贴上去。
+        // 竖屏坐标系（旋转未能同步到这里时）：用户视角的顶边是左右两条长边，卡片旋转 90° 贴上去。
         BOOL leftSide = self.anchorLeftEdgeUp;
-        CGFloat centerX = leftSide ? (inset + self.barThickness / 2.0)
-                                   : (spaceWidth - inset - self.barThickness / 2.0);
-        self.bar.center = CGPointMake(centerX, spaceHeight / 2.0);
-        self.bar.transform = CGAffineTransformMakeRotation(leftSide ? -M_PI_2 : M_PI_2);
+        CGFloat centerX = leftSide ? (inset + size.height / 2.0)
+                                   : (spaceWidth - inset - size.height / 2.0);
+        self.card.center = CGPointMake(centerX, spaceHeight / 2.0);
+        self.card.transform = CGAffineTransformMakeRotation(leftSide ? -M_PI_2 : M_PI_2);
     }
-
-    [self placePanelInSpace:space];
-}
-
-/// 面板挨着胶囊"内侧"居中摆放。
-///
-/// ⚠️ 这里必须同时支持两种坐标系：
-/// - 横屏坐标系（窗口已按横屏铺开，932x430）：面板横着摆在胶囊下沿；
-/// - 竖屏坐标系（430x932）：**大多数游戏是自己转画面**，SpringBoard 的场景窗口并不会跟着转。
-///   胶囊靠 placeBarInBounds: 的旋转兜底显示出来了，面板以前却在这一步被直接藏掉 ——
-///   于是"进了游戏点一下没任何反应"，这就是 1.1-24 修过手势之后仍然弹不出的真正原因。
-///   现在把面板也旋转 90° 贴到胶囊同一侧，方向与胶囊一致。
-- (void)placePanelInSpace:(CGRect)space {
-    if (!self.panel) return;
-    CGFloat spaceWidth = CGRectGetWidth(space);
-    CGFloat spaceHeight = CGRectGetHeight(space);
-    // ⚠️ 这里绝不能碰 panel.hidden —— 每次方向轮询都会经 placeBarInBounds: 调到这里，
-    // 一旦在这里设 hidden = NO，收起状态的空面板就会被"排"到屏幕上。
-    // 显示/隐藏只由 showPanel / hidePanel 决定。
-    if (spaceWidth <= 0.0 || spaceHeight <= 0.0) return;
-
-    BOOL landscapeSpace = spaceWidth > spaceHeight;
-    // 用户视角的"宽度"：横屏坐标系是 spaceWidth，竖屏坐标系是 spaceHeight。
-    CGFloat visualWidth = landscapeSpace ? spaceWidth : spaceHeight;
-    CGFloat panelWidth = MIN(460.0, MAX(280.0, visualWidth - 80.0));
-    CGFloat panelHeight = PGPanelHeight;
-    CGFloat barThickness = self.barThickness > 0.0 ? self.barThickness : 30.0;
-
-    self.panel.transform = CGAffineTransformIdentity;
-    self.panel.bounds = CGRectMake(0.0, 0.0, panelWidth, panelHeight);
-
-    if (landscapeSpace) {
-        CGFloat barBottom = self.bar ? CGRectGetMaxY(self.bar.frame) : barThickness;
-        self.panel.center = CGPointMake(spaceWidth / 2.0, barBottom + 10.0 + panelHeight / 2.0);
-        return;
-    }
-
-    // 竖屏坐标系：胶囊贴在某条长边上（anchorLeftEdgeUp 决定贴左还是贴右），
-    // 面板往"内侧"（用户视角的下方）偏移；旋转后沿 x 轴占的是 panelHeight，所以偏移量用它的一半。
-    BOOL leftSide = self.anchorLeftEdgeUp;
-    CGFloat barCenterX = leftSide
-        ? (PGLandscapeBarEdgeInset + barThickness / 2.0)
-        : (spaceWidth - PGLandscapeBarEdgeInset - barThickness / 2.0);
-    CGFloat innerOffset = barThickness / 2.0 + 10.0 + panelHeight / 2.0;
-    self.panel.center = CGPointMake(leftSide ? (barCenterX + innerOffset) : (barCenterX - innerOffset),
-                                    spaceHeight / 2.0);
-    self.panel.transform = CGAffineTransformMakeRotation(leftSide ? -M_PI_2 : M_PI_2);
 }
 
 - (void)hideBar {
     if (self.updating) {
-        [self.bar stopUpdating];
+        [self.card stopTicking];
         self.updating = NO;
     }
-    [self hidePanel];
-    [self.bar.layer removeAllAnimations];
-    self.bar.alpha = 1.0;
-    self.bar.hidden = YES;
+    [self hideControls];
+    [self.card.layer removeAllAnimations];
+    self.card.alpha = 1.0;
+    self.card.hidden = YES;
     self.window.hidden = YES;
     self.laidOut = NO;
     self.needsResize = NO;
@@ -2193,21 +2684,23 @@ static BOOL PGFrontmostHasEverResolved(void) {
 
 - (void)teardownWindow {
     if (self.updating) {
-        [self.bar stopUpdating];
+        [self.card stopTicking];
         self.updating = NO;
     }
+    [self.controlsTimer invalidate];
+    self.controlsTimer = nil;
     self.window.hidden = YES;
     self.window.rootViewController = nil;
     self.window = nil;
-    self.bar = nil;
-    self.panel = nil;
-    self.panelVisible = NO;
+    self.card = nil;
+    self.liveCardScale = 0.0;
+    self.controlsVisible = NO;
     self.laidOut = NO;
     self.needsResize = NO;
     self.visible = NO;
     self.appearedOnce = NO;
-    self.barLength = 0.0;
-    self.barThickness = 0.0;
+    self.cardLength = 0.0;
+    self.cardThickness = 0.0;
 }
 
 @end
