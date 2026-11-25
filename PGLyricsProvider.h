@@ -9,7 +9,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)sharedInstance;
 
-/// 请求某首歌的歌词。同一首歌重复调用是空操作；失败后 60 秒内不再重试。
+/// 请求某首歌的歌词。同一首歌重复调用是空操作；失败后 15 秒内不再重试。
 /// title/artist 传 nil 或空串 = 清空当前歌词。
 - (void)requestLyricsForTitle:(nullable NSString *)title
                        artist:(nullable NSString *)artist

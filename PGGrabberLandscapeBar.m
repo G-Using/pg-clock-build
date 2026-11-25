@@ -319,6 +319,9 @@ static BOOL PGStartFBSObserver(void) {
 /// 播放控制区的展开 / 收起。卡片高度由宿主（PGLandscapeBar）负责，这里只管内容与透明度。
 - (void)setControlsVisible:(BOOL)visible animated:(BOOL)animated;
 
+/// 背景两态切换：收起 = 纯色（或透明），展开 = 整卡毛玻璃。
+- (void)applyBackgroundStyleAnimated:(BOOL)animated;
+
 - (void)startTicking;
 - (void)stopTicking;
 /// 点按落点判定，返回 YES 表示这次点按已被消费（点在封面上 → 跳播放器）。
@@ -373,6 +376,13 @@ static BOOL PGCardShowsLyrics(void) {
     return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : YES;
 }
 
+/// 收起态要不要垫一块纯色底。默认 YES。
+/// 关掉就完全透明 —— 只剩文字浮在游戏画面上；展开后仍然是整卡毛玻璃。
+static BOOL PGCardCollapsedSolidEnabled(void) {
+    id value = PGCardPreference(@"LandscapeCollapsedSolid", @YES);
+    return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : YES;
+}
+
 /// 卡片当前倍数。0.7 ~ 2.2，默认 1.35（320 → 432 宽，横屏 932 宽下约占 46%）。
 static CGFloat PGCardScaleValue(void) {
     id value = PGCardPreference(@"LandscapeCardScale", @1.35);
@@ -414,6 +424,8 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
 @end
 
 @implementation PGLandscapeMusicCard {
+    /// 收起态的纯色底（颜色取「玻璃色调」）。展开后让位给下面的毛玻璃。
+    UIView *_solidView;
     UIVisualEffectView *_blurView;
     UIView *_tintView;
     CAGradientLayer *_tintGradient;
@@ -484,6 +496,9 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     CGFloat _appliedOpacity;
     NSString *_appliedTintKey;
     BOOL _appliedLyrics;
+    /// 当前背景处于哪一态（YES = 展开 / 毛玻璃），以及「收起时纯色背景」开关的上次值。
+    BOOL _backgroundExpanded;
+    BOOL _appliedSolidEnabled;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -497,6 +512,13 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
         self.layer.borderWidth = 1.2 / MAX(UIScreen.mainScreen.scale, 1.0);
         self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.38].CGColor;
 
+        // 收起态：一块纯色底，颜色取「玻璃色调」。用户关掉「收起时纯色背景」就完全透明。
+        // 放最底层 —— 展开时它的 alpha 归零，让上面的毛玻璃接替。
+        _solidView = [UIView new];
+        _solidView.userInteractionEnabled = NO;
+        _solidView.alpha = 0.0;
+        [self addSubview:_solidView];
+
         // 毛玻璃：ultraThin 最透，背后游戏的色块会被糊开、颜色透上来。
         // 半径与不透明度都可由用户调（设置里的两个滑块），默认值沿用 1.1-33 调通透后的那套。
         UIBlurEffect *effect = nil;
@@ -507,7 +529,8 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
         }
         _blurView = [[UIVisualEffectView alloc] initWithEffect:effect];
         _blurView.userInteractionEnabled = NO;
-        _blurView.alpha = 0.80;
+        // 收起态不显示玻璃：整卡毛玻璃只在展开时出现（背景态由 applyBackgroundStyle 切换）。
+        _blurView.alpha = 0.0;
         [self addSubview:_blurView];
 
         // 用户选的色调叠一层，透明度跟着玻璃浓度走：越不透明，颜色越明显。
@@ -542,6 +565,8 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
         _controlsContainer.alpha = 0.0;
         _controlsContainer.userInteractionEnabled = NO;
         _separator.hidden = YES;
+        // 首帧就摆到收起态该有的样子，避免刚出现时闪一下玻璃。
+        [self applyBackgroundStyleAnimated:NO];
     }
     return self;
 }
@@ -923,6 +948,11 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
             [self applyLyricPrimary:nil secondary:nil force:force];
         } else {
             [self applyLyricPrimary:@"暂无歌词" secondary:nil force:force];
+            // 失败不等于永远没有：网络抖一下、接口刚超时都会走到这里。
+            // 每拍都问一次，provider 内部有 15 秒冷却，不会真的反复打接口。
+            if (_hasMedia && _shownTitle.length) {
+                [provider requestLyricsForTitle:_shownTitle artist:_shownArtist duration:_duration];
+            }
         }
         return;
     }
@@ -1081,6 +1111,8 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     if (_controlsVisible == visible) return;
     _controlsVisible = visible;
     _controlsContainer.userInteractionEnabled = visible;
+    // 背景跟着一起换：收起是纯色 / 透明，展开整卡毛玻璃。和高度动画同时进行。
+    [self applyBackgroundStyleAnimated:animated];
     // 收起态的卡片只有状态行那么高，分隔线正好压在底边上（看起来像一条脏边）→ 收起时直接藏掉。
     _separator.hidden = !visible;
     // 状态行里的播放状态只在收起态显示（展开后由下面的歌曲区承担），需要重排一次。
@@ -1207,6 +1239,37 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     return nil;
 }
 
+/// 背景只有两态，切换点就是"展开 / 收起"：
+///   收起 = 一块纯色（颜色取设置里的「玻璃色调」）；把「收起时纯色背景」关掉就完全透明，只留文字。
+///   展开 = 整卡毛玻璃（模糊 + 色调 + 高光），这样展开时三层信息压在同一块玻璃上，不会一段一种底色。
+- (void)applyBackgroundStyleAnimated:(BOOL)animated {
+    BOOL expanded = _controlsVisible;
+    BOOL solidEnabled = PGCardCollapsedSolidEnabled();
+    CGFloat opacity = PGCardGlassOpacity();
+
+    _solidView.backgroundColor = [PGCardTintColor() colorWithAlphaComponent:0.92];
+    _backgroundExpanded = expanded;
+    _appliedSolidEnabled = solidEnabled;
+
+    void (^apply)(void) = ^{
+        self->_solidView.alpha = (expanded || !solidEnabled) ? 0.0 : 1.0;
+        self->_blurView.alpha = expanded ? opacity : 0.0;
+        self->_tintView.alpha = expanded ? 1.0 : 0.0;
+        self->_sheenView.alpha = expanded ? 1.0 : 0.0;
+    };
+
+    if (!animated) {
+        apply();
+        return;
+    }
+    [UIView animateWithDuration:0.18
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction
+                     animations:apply
+                     completion:nil];
+}
+
 - (void)applyGlassIfNeeded {
     CGFloat blur = PGCardBlurRadius();
     CGFloat opacity = PGCardGlassOpacity();
@@ -1226,7 +1289,8 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     if (toneChanged) {
         _appliedOpacity = opacity;
         _appliedTintKey = tintKey;
-        _blurView.alpha = opacity;
+        // 收起态玻璃整体不可见，这里只在展开态给浓度 —— 否则拖一下滑块收起态就透出模糊底。
+        _blurView.alpha = _controlsVisible ? opacity : 0.0;
         // 越不透明，色调越明显；玻璃很透的时候只留一丝色偏，别把游戏画面糊成一块。
         _tintView.backgroundColor = [tint colorWithAlphaComponent:0.10 + 0.30 * opacity];
         _tintGradient.colors = @[(__bridge id)[tint colorWithAlphaComponent:0.0].CGColor,
@@ -1253,6 +1317,7 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     if (!isfinite(s) || s <= 0.0) s = 1.0;
     CGFloat textScale = sqrt(s);
 
+    _solidView.frame = self.bounds;
     _blurView.frame = self.bounds;
     _tintView.frame = self.bounds;
     _tintGradient.frame = _tintView.bounds;
@@ -1260,6 +1325,12 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     _sheenGradient.frame = _sheenView.bounds;
 
     [self applyGlassIfNeeded];
+    // 色调 / 「收起时纯色背景」开关可能刚被改过（设置页拖动），而展开状态没变 —— 也要立刻跟上。
+    _solidView.backgroundColor = [PGCardTintColor() colorWithAlphaComponent:0.92];
+    if (_backgroundExpanded != _controlsVisible ||
+        _appliedSolidEnabled != PGCardCollapsedSolidEnabled()) {
+        [self applyBackgroundStyleAnimated:NO];
+    }
     [self applyScale:s textScale:textScale];
 
     CGFloat pad = PGCardPadding * s;
@@ -1420,7 +1491,10 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     _remainingLabel.font = _elapsedLabel.font;
 
     CGFloat shadowRadius = 3.0 * textScale;
-    for (UILabel *label in @[_titleLabel, _artistLabel, _lyricLabel]) {
+    // 收起态可以被设成"完全透明"，这时文字直接压在游戏画面上 —— 状态行那几个 label
+    // 也必须有投影，否则遇到浅色场景（海面、雪地）就糊成一片看不见。
+    for (UILabel *label in @[_clockLabel, _batteryLabel, _thermalLabel, _cpuLabel, _musicLabel,
+                             _titleLabel, _artistLabel, _lyricLabel]) {
         label.layer.shadowRadius = shadowRadius;
         label.layer.shadowOffset = CGSizeMake(0.0, textScale);
     }
@@ -1603,7 +1677,8 @@ static CFTimeInterval PGFrontmostStuckAt = 0.0;
 static NSString *PGFrontmostFromDisplayLayout(void) {
     static id monitor = nil;
     static CFTimeInterval monitorCreatedAt = 0.0;
-    static CFTimeInterval lastLayoutAt = 0.0;
+    static CFTimeInterval lastUsableAt = 0.0;
+    static CFTimeInterval lastRebuildAt = 0.0;
     static NSInteger rebuildCount = 0;
 
     CFTimeInterval now = CACurrentMediaTime();
@@ -1612,8 +1687,15 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
     // monitor.currentLayout 会一直是 nil —— 而且它"只在有变化时推送"，桌面上什么都不变，
     // 于是这个 nil 会一直挂到某个 App 启动为止。
     // 这正是"刚注销、没打开任何 App 时，桌面横过来会冒出横屏块；开个 App 再回桌面就正常"的成因。
-    // 所以：拿不到布局超过 2 秒就换一个新的 monitor（限 10 次，避免极端情况下反复重建）。
-    if (monitor && lastLayoutAt <= 0.0 && now - monitorCreatedAt > 2.0 && rebuildCount < 10) {
+    //
+    // 更隐蔽的一种：currentLayout 有值，但 elements 是空数组。游戏切前后台之后 FBS 偶尔会
+    // 停在这个状态并且不再推送 —— 以前只在"从未拿到布局"时重建 monitor，拿到过一次就再也不换，
+    // 于是这一路永久返回 nil → 永久 Unknown → 横屏卡片再也不出来。
+    // 现在"连续 2 秒拿不到非空布局"就换一个新 monitor（5 秒冷却，不限次数）。
+    BOOL stale = (lastUsableAt <= 0.0 && now - monitorCreatedAt > 2.0) ||
+                 (lastUsableAt > 0.0 && now - lastUsableAt > 2.0);
+    BOOL canRebuild = (lastRebuildAt <= 0.0 || now - lastRebuildAt > 5.0);
+    if (monitor && stale && canRebuild) {
         @try {
             ((void (*)(id, SEL))objc_msgSend)(monitor, @selector(invalidate));
         } @catch (NSException *exception) {
@@ -1621,7 +1703,9 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
         }
         monitor = nil;
         rebuildCount++;
-        PGLog(@"白名单探针: 布局 2 秒没回来，重建 monitor（第 %ld 次）", (long)rebuildCount);
+        lastRebuildAt = now;
+        lastUsableAt = 0.0;
+        PGLog(@"白名单探针: 布局 2 秒没拿到有效元素，重建 monitor（第 %ld 次）", (long)rebuildCount);
     }
 
     if (!monitor) {
@@ -1656,8 +1740,6 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
         layout = nil;
     }
     if (!layout) return nil;
-    // 布局真的拿到了：记一笔，避免上面那条"重建"逻辑把好好的 monitor 换掉。
-    lastLayoutAt = now;
 
     NSArray *elements = nil;
     @try {
@@ -1666,7 +1748,9 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
     } @catch (NSException *exception) {
         elements = nil;
     }
+    // 必须有元素才算"这一路可用"：空数组同样说明探针废了，交给上面的重建逻辑换 monitor。
     if (elements.count == 0) return nil;
+    lastUsableAt = now;
 
     NSString *winner = nil;
     double winnerLevel = -1.0e9;
@@ -1906,6 +1990,9 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 @property (nonatomic, assign) CFTimeInterval lastWindowRebuild;
 /// 窗口挂错场景的起始时刻（0 = 当前没问题）。确认 0.8 秒才真的重建。
 @property (nonatomic, assign) CFTimeInterval sceneMismatchSince;
+/// "应该显示、但 showCard 一直没成功"的起始时刻。用来做最后一道看门狗：
+/// 连续 2 秒都显示不出来就推倒重来（清时间戳 + 拆窗口 + 立即重建）。
+@property (nonatomic, assign) CFTimeInterval showStallSince;
 /// 显示/隐藏抖动检测：窗口期内翻转次数，以及熔断到期时间。
 @property (nonatomic, assign) NSInteger toggleBurst;
 @property (nonatomic, assign) CFTimeInterval burstWindowStart;
@@ -1928,6 +2015,9 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 /// 探针这一拍没拿到前台 App 的起始时刻。用来做 0.45s 的过渡防抖：
 /// 从 App 退回桌面的那几拍会有短暂空窗，立刻收块会闪一下。
 @property (nonatomic, assign) CFTimeInterval frontmostMissingSince;
+
+/// 把卡片放到屏幕上。返回 YES = 这一次确实把窗口和卡片都摆出来了。
+- (BOOL)showCardLeftEdgeUp:(BOOL)leftEdgeUp;
 
 @end
 
@@ -2367,7 +2457,14 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 #pragma mark 轮询
 
 - (void)startPolling {
-    if (self.pollTimer) return;
+    // 属性非 nil 不代表还活着：定时器可能已经被系统 / runloop 收掉。
+    // 不校验 isValid 的话，一旦它失效，整条可见性轮询就永久停了 —— 卡片再也出不来。
+    if (self.pollTimer && self.pollTimer.isValid) return;
+    if (self.pollTimer) {
+        PGLog(@"轮询定时器已失效，重新启动");
+        [self.pollTimer invalidate];
+        self.pollTimer = nil;
+    }
     NSTimer *timer = [NSTimer timerWithTimeInterval:PGLandscapePollInterval
                                              target:self
                                            selector:@selector(pollTick)
@@ -2486,7 +2583,25 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
         [self noteToggleAt:now];
     }
 
-    [self showCardLeftEdgeUp:leftEdgeUp];
+    if ([self showCardLeftEdgeUp:leftEdgeUp]) {
+        self.showStallSince = 0.0;
+    } else if (self.showStallSince <= 0.0) {
+        self.showStallSince = now;
+        PGLog(@"显示看门狗: 这一拍没能建出窗口，开始计时");
+    } else if (now - self.showStallSince > 2.0) {
+        // 最后一道看门狗。判定该显示、却连续 2 秒建不出窗口 —— 把所有状态清干净再重来一次。
+        // 只有"横屏 + 前台放行"的分支才会走到这里，桌面 / 竖屏不会误触发。
+        PGLog(@"显示看门狗: 连续 %.1fs 该显示却没窗口 → 清空状态并强制重建",
+              now - self.showStallSince);
+        self.showStallSince = 0.0;
+        self.lastHideTime = 0.0;
+        self.landscapeSince = now;
+        self.portraitSince = 0.0;
+        self.flickerLockUntil = 0.0;
+        self.sceneMismatchSince = 0.0;
+        [self teardownWindow];
+        [self showCardLeftEdgeUp:leftEdgeUp];
+    }
     [self logSnapshotShown:YES note:[@"show/" stringByAppendingString:source]];
 }
 
@@ -2617,11 +2732,16 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
             return self.visible;
         }
         if (now - self.frontmostMissingSince < 2.5) return self.visible;
-        if (![self.lastBlockedApp isEqualToString:@"<home>"]) {
-            self.lastBlockedApp = @"<home>";
-            PGLog(@"前台: 持续 2.5s 拿不到前台 App（探针无响应）→ 隐藏横屏块");
+        // ⚠️ 以前这里直接 return NO。后果是：探针一旦坏掉（FBS 的 displayLayout 返回空数组，
+        // 游戏切前后台时很容易出现），就永久判定"不在前台"，而且这段状态活在 SpringBoard 进程里
+        // —— 退游戏、杀游戏重进都救不回来，只能注销（用户实测连续三个版本都是这个现象）。
+        // 现在改成降级放行：真在桌面时 FBS 会明确报 com.apple.springboard，走上面的 HomeScreen 分支，
+        // 不会因此在桌面上乱冒卡片。宁可偶尔多显示，也不能让功能整个消失。
+        if (![self.lastBlockedApp isEqualToString:@"<probe-degraded>"]) {
+            self.lastBlockedApp = @"<probe-degraded>";
+            PGLog(@"前台: 探针持续 2.5s 无响应 → 降级放行，避免横屏卡片被永久隐藏");
         }
-        return NO;
+        return YES;
     }
 
     self.frontmostMissingSince = 0.0;
@@ -2682,7 +2802,7 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 
 #pragma mark 显示
 
-- (void)showCardLeftEdgeUp:(BOOL)leftEdgeUp {
+- (BOOL)showCardLeftEdgeUp:(BOOL)leftEdgeUp {
     // 长时间隐藏之后再出现（退桌面 / 切别的 App / 回游戏）：直接把窗口拆了重来。
     // 旧窗口可能挂在一个已失效或已退到后台的场景上，也可能成了孤儿 ——
     // 这几种情况 window.hidden = NO 都不会把它画出来。重建一次最省心，代价只有几毫秒。
@@ -2693,7 +2813,16 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
         self.lastHideTime = 0.0;
     }
 
-    if (![self ensureWindowAndSubviews]) return;
+    if (![self ensureWindowAndSubviews]) return NO;
+
+    // 场景自检：还有可用的 windowScene，但窗口自己没挂上（legacy 窗口 / 场景被系统回收）。
+    // 这种窗口把 hidden 设成 NO 也不会渲染 —— 必须重建。
+    if (PGLandscapeHostScene() && !self.window.windowScene) {
+        PGLog(@"卡片场景自检: 有可用场景但窗口没挂上 → 重建");
+        [self teardownWindow];
+        if (![self ensureWindowAndSubviews]) return NO;
+    }
+
     if (!self.updating) {
         [self.card startTicking];
         self.updating = YES;
@@ -2730,6 +2859,7 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
     }
     self.lastShowTime = CACurrentMediaTime();
     self.visible = YES;
+    return YES;
 }
 
 - (BOOL)ensureWindowAndSubviews {
@@ -2918,6 +3048,8 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
     self.visible = NO;
     self.landscapeSince = 0.0;
     self.portraitSince = 0.0;
+    // 隐藏期间不算"该显示却没显示"，否则下次转回横屏第一拍就会误触发看门狗。
+    self.showStallSince = 0.0;
     // 只记"真的从显示变成隐藏"那一次。inactive / suspended 每拍都会调到这里，
     // 若无条件刷新，重新启用时永远算不出"藏了多久"，那条重建窗口的兜底就失效了。
     if (wasVisible) self.lastHideTime = CACurrentMediaTime();

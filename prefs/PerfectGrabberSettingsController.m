@@ -190,7 +190,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:[self landscapeAppsButtonTitle] action:@selector(chooseLandscapeApps)]];
 
     PSSpecifier *landscape = [PSSpecifier groupSpecifierWithName:@"横屏音乐卡片"];
-    [landscape setProperty:@"横屏时只留这一张卡片。平时是收起状态，只有一行：时间 / 电量（充电带闪电）/ 电池温度 / CPU 占用率，外加 ♪ 歌名·歌手 和播放状态（和 1.1 系列的胶囊一样）。\n\n点一下（或长按）才展开：封面 + 歌名 + 歌手 + 实时歌词，下面接播放控制（上一首 / 播放暂停 / 下一首 + 进度条）；3 秒没操作自动收回成状态条，按按钮会重新计时。双指点击也能展开，双指捏合可直接调大小。没在放歌时收起行显示「♪ 未播放」，展开后封面照常显示。\n\n卡片吸附屏幕边缘：先选「吸附位置」，再用「边缘间距」调离边缘留多少空隙（0 = 完全贴边）。\n\n整张卡只有一套背景：毛玻璃 + 可调模糊半径 / 不透明度 / 色调。歌词按「歌名 + 歌手 + 时长」联网匹配（网易云，无结果时换 LRCLIB），需要联网；匹配不到显示「暂无歌词」。"
+    [landscape setProperty:@"横屏时只留这一张卡片。平时是收起状态，只有一行：时间 / 电量（充电带闪电）/ 电池温度 / CPU 占用率，外加 ♪ 歌名·歌手 和播放状态（和 1.1 系列的胶囊一样）。收起时背景是一块纯色（取下面的「玻璃色调」）；把「收起时纯色背景」关掉就完全透明，只留文字。\n\n点一下（或长按）才展开：封面 + 歌名 + 歌手 + 实时歌词，下面接播放控制（上一首 / 播放暂停 / 下一首 + 进度条）—— 整张卡这时候才是毛玻璃效果。3 秒没操作自动收回成状态条，按按钮会重新计时。双指点击也能展开，双指捏合可直接调大小。没在放歌时收起行显示「♪ 未播放」，展开后封面照常显示。\n\n卡片吸附屏幕边缘：先选「吸附位置」，再用「边缘间距」调离边缘留多少空隙（0 = 完全贴边）。\n\n歌词按「歌名 + 歌手 + 时长」联网匹配：网易云优先，同名版本没收录歌词时会把歌手串里的原名再搜一遍，仍无结果换 LRCLIB；需要联网，匹配不到显示「暂无歌词」。"
                 forKey:PSFooterTextGroupKey];
     [items addObject:landscape];
 
@@ -228,7 +228,9 @@ static void PGWriteValue(NSString *key, id value) {
     [glassOpacity setProperty:@YES forKey:@"showValue"];
     [items addObject:glassOpacity];
 
-    [items addObject:[self buttonNamed:@"玻璃色调" action:@selector(chooseLandscapeTintColor)]];
+    [items addObject:[self buttonNamed:@"卡片色调（收起底色 / 玻璃）" action:@selector(chooseLandscapeTintColor)]];
+    [items addObject:[self preferenceNamed:@"收起时纯色背景" key:@"LandscapeCollapsedSolid"
+                              defaultValue:@YES cell:PSSwitchCell]];
     [items addObject:[self preferenceNamed:@"显示歌词" key:@"LandscapeLyrics" defaultValue:@YES cell:PSSwitchCell]];
 
     [items addObject:[PSSpecifier groupSpecifierWithName:@"操作"]];
@@ -236,7 +238,7 @@ static void PGWriteValue(NSString *key, id value) {
     [items addObject:[self buttonNamed:@"注销桌面" action:@selector(onRespring)]];
 
     PSSpecifier *footer = [PSSpecifier emptyGroupSpecifier];
-    [footer setProperty:@"Ntonia-PreferenceLoader 1.3-0" forKey:PSFooterTextGroupKey];
+    [footer setProperty:@"Ntonia-PreferenceLoader 1.4-0" forKey:PSFooterTextGroupKey];
     [items addObject:footer];
     _specifiers = items;
     self.lastLandscapeAppCount = [self selectedLandscapeAppCount];
@@ -381,7 +383,7 @@ static void PGWriteValue(NSString *key, id value) {
 - (void)onResetSettings {
     NSArray *keys = @[@"EnabledPerfectGrabber", @"VibrationFeedback", @"ShowOnSwipeUp", @"LandscapeAlwaysOn",
                       @"LandscapeCardScale", @"LandscapeGlassBlur", @"LandscapeGlassOpacity",
-                      @"LandscapeGlassTint", @"LandscapeLyrics",
+                      @"LandscapeGlassTint", @"LandscapeLyrics", @"LandscapeCollapsedSolid",
                       @"LandscapeSnapPosition", @"LandscapeSnapInset",
                       @"LandscapeAppFilterEnabled", @"LandscapeAppAllowList", @"LandscapePanelScale",
                       @"Disable24H", @"ChargingIcon",
