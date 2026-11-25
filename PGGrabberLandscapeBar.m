@@ -722,10 +722,11 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
         _trackKey = trackKey;
         _lyricPrimary = nil;
         _lyricSecondary = nil;
-        [self refreshLyricText:YES];
+        // 先清掉上一首的歌词再刷新文案，否则换歌瞬间会闪一下旧歌词。
         [[PGLyricsProvider sharedInstance] requestLyricsForTitle:(hasMedia ? title : nil)
                                                           artist:(hasMedia ? artist : nil)
                                                         duration:duration];
+        [self refreshLyricText:YES];
     }
 
     if (artworkData != _lastArtworkData) {
