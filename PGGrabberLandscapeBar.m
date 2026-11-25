@@ -365,21 +365,24 @@ static CGFloat PGCardGlassOpacity(void) {
     return MAX(0.30, MIN(1.0, opacity));
 }
 
+/// 卡片底色直接跟随设置里「背景」那一组，不再另发明一套：
+///   「启用背景颜色」开着 → 用「背景颜色」；
+///   关着           → 收起态完全透明（只剩文字），展开态退回中性深色玻璃。
+static BOOL PGCardBackgroundEnabled(void) {
+    id value = PGCardPreference(@"EnabledBackgroundColor", @NO);
+    return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : NO;
+}
+
+/// 卡片用色。来源同上；关闭背景色时给一个中性的深色（展开态玻璃需要一点底色压住画面）。
 static UIColor *PGCardTintColor(void) {
-    NSString *hex = PGCardPreference(@"LandscapeGlassTint", @"#0B0F14");
-    return [PerfectGrabberPreferences colorFromHexString:hex
-                                               fallback:[UIColor colorWithWhite:0.04 alpha:1.0]];
+    UIColor *fallback = [UIColor colorWithWhite:0.04 alpha:1.0];
+    if (!PGCardBackgroundEnabled()) return fallback;
+    NSString *hex = PGCardPreference(@"BackgroundColor", @"#00BFFF");
+    return [PerfectGrabberPreferences colorFromHexString:hex fallback:fallback];
 }
 
 static BOOL PGCardShowsLyrics(void) {
     id value = PGCardPreference(@"LandscapeLyrics", @YES);
-    return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : YES;
-}
-
-/// 收起态要不要垫一块纯色底。默认 YES。
-/// 关掉就完全透明 —— 只剩文字浮在游戏画面上；展开后仍然是整卡毛玻璃。
-static BOOL PGCardCollapsedSolidEnabled(void) {
-    id value = PGCardPreference(@"LandscapeCollapsedSolid", @YES);
     return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : YES;
 }
 
@@ -1240,19 +1243,20 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
 }
 
 /// 背景只有两态，切换点就是"展开 / 收起"：
-///   收起 = 一块纯色（颜色取设置里的「玻璃色调」）；把「收起时纯色背景」关掉就完全透明，只留文字。
-///   展开 = 整卡毛玻璃（模糊 + 色调 + 高光），这样展开时三层信息压在同一块玻璃上，不会一段一种底色。
+///   收起 = 跟随设置里「启用背景颜色」：开着就是「背景颜色」纯色块，关着就**完全透明**，
+///          只剩文字浮在游戏画面上（状态行 / 歌名都带投影，浅色场景也看得清）。
+///   展开 = 整卡毛玻璃（模糊 + 色调 + 高光），三层信息压在同一块玻璃上，不会一段一种底色。
 - (void)applyBackgroundStyleAnimated:(BOOL)animated {
     BOOL expanded = _controlsVisible;
-    BOOL solidEnabled = PGCardCollapsedSolidEnabled();
+    BOOL backgroundEnabled = PGCardBackgroundEnabled();
     CGFloat opacity = PGCardGlassOpacity();
 
     _solidView.backgroundColor = [PGCardTintColor() colorWithAlphaComponent:0.92];
     _backgroundExpanded = expanded;
-    _appliedSolidEnabled = solidEnabled;
+    _appliedSolidEnabled = backgroundEnabled;
 
     void (^apply)(void) = ^{
-        self->_solidView.alpha = (expanded || !solidEnabled) ? 0.0 : 1.0;
+        self->_solidView.alpha = (expanded || !backgroundEnabled) ? 0.0 : 1.0;
         self->_blurView.alpha = expanded ? opacity : 0.0;
         self->_tintView.alpha = expanded ? 1.0 : 0.0;
         self->_sheenView.alpha = expanded ? 1.0 : 0.0;
@@ -1325,10 +1329,10 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     _sheenGradient.frame = _sheenView.bounds;
 
     [self applyGlassIfNeeded];
-    // 色调 / 「收起时纯色背景」开关可能刚被改过（设置页拖动），而展开状态没变 —— 也要立刻跟上。
+    // 背景色 / 「启用背景颜色」开关可能刚被改过（设置页拖动），而展开状态没变 —— 也要立刻跟上。
     _solidView.backgroundColor = [PGCardTintColor() colorWithAlphaComponent:0.92];
     if (_backgroundExpanded != _controlsVisible ||
-        _appliedSolidEnabled != PGCardCollapsedSolidEnabled()) {
+        _appliedSolidEnabled != PGCardBackgroundEnabled()) {
         [self applyBackgroundStyleAnimated:NO];
     }
     [self applyScale:s textScale:textScale];
@@ -1493,10 +1497,20 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     CGFloat shadowRadius = 3.0 * textScale;
     // 收起态可以被设成"完全透明"，这时文字直接压在游戏画面上 —— 状态行那几个 label
     // 也必须有投影，否则遇到浅色场景（海面、雪地）就糊成一片看不见。
+    // ⚠️ 光设 shadowRadius 没用：CALayer 的 shadowOpacity 默认是 0，必须显式给上。
     for (UILabel *label in @[_clockLabel, _batteryLabel, _thermalLabel, _cpuLabel, _musicLabel,
                              _titleLabel, _artistLabel, _lyricLabel]) {
+        label.layer.shadowColor = UIColor.blackColor.CGColor;
+        label.layer.shadowOpacity = 0.55;
         label.layer.shadowRadius = shadowRadius;
         label.layer.shadowOffset = CGSizeMake(0.0, textScale);
+    }
+    // 图标同理：透明模式下白色 SF Symbol 压在浅色画面上同样会糊。
+    for (UIImageView *icon in @[_boltIcon, _batteryIcon, _thermalIcon, _musicNoteView, _musicStateView]) {
+        icon.layer.shadowColor = UIColor.blackColor.CGColor;
+        icon.layer.shadowOpacity = 0.55;
+        icon.layer.shadowRadius = shadowRadius;
+        icon.layer.shadowOffset = CGSizeMake(0.0, textScale);
     }
 
     [self setSymbol:@"backward.fill" onButton:_previousButton pointSize:10.0 * textScale];
@@ -1754,6 +1768,8 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
 
     NSString *winner = nil;
     double winnerLevel = -1.0e9;
+    NSString *appWinner = nil;
+    double appWinnerLevel = -1.0e9;
     NSUInteger appElementCount = 0;
     for (id element in elements) {
         NSString *identifier = nil;
@@ -1774,7 +1790,21 @@ static NSString *PGFrontmostFromDisplayLayout(void) {
             winnerLevel = level;
             winner = identifier;
         }
+        // ⚠️ 单独记一个"非 SpringBoard 的最高层元素"。
+        // 不能只用全场最高的那个来判前台：横屏卡片是本进程（SpringBoard）建的窗口，
+        // windowLevel = UIAlert + 1000000，只要它在显示，FBS 就会把 com.apple.springboard
+        // 这个元素顶成全场最高 —— 于是"是否在桌面"被误判成 YES，卡片被自己藏掉，
+        // 藏掉之后下一拍 App 又最高 → 再显示 → 再藏，最后卡在隐藏态。
+        // 表现为：上滑/下拉面板都正常，只有横屏卡片再也出不来，杀 App / 大退都救不回来。
+        if (![identifier isEqualToString:@"com.apple.springboard"] && level >= appWinnerLevel) {
+            appWinnerLevel = level;
+            appWinner = identifier;
+        }
     }
+
+    // 只要有 App 元素在布局里，前台就是那个 App（App 退到后台会从布局里消失）。
+    // 桌面上不存在任何 App 元素，只剩 springboard —— 那才是真的"在桌面"。
+    if (appWinner.length > 0) winner = appWinner;
 
     // 只在层级归属变化时打一行，方便排查"桌面上为什么还显示"。
     static NSString *lastWinner = nil;
@@ -1993,6 +2023,9 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 /// "应该显示、但 showCard 一直没成功"的起始时刻。用来做最后一道看门狗：
 /// 连续 2 秒都显示不出来就推倒重来（清时间戳 + 拆窗口 + 立即重建）。
 @property (nonatomic, assign) CFTimeInterval showStallSince;
+/// 探针报「在桌面」的起始时刻。必须连续确认一段时间才相信 ——
+/// 探针偶尔会把 SpringBoard 自己的窗口误当成桌面，一拍就判死会让卡片再也出不来。
+@property (nonatomic, assign) CFTimeInterval homeScreenSince;
 /// 显示/隐藏抖动检测：窗口期内翻转次数，以及熔断到期时间。
 @property (nonatomic, assign) NSInteger toggleBurst;
 @property (nonatomic, assign) CFTimeInterval burstWindowStart;
@@ -2018,6 +2051,8 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 
 /// 把卡片放到屏幕上。返回 YES = 这一次确实把窗口和卡片都摆出来了。
 - (BOOL)showCardLeftEdgeUp:(BOOL)leftEdgeUp;
+/// 状态机认为在显示，但窗口有硬证据表明它不在屏幕上。
+- (BOOL)cardVisuallyDetached;
 
 @end
 
@@ -2328,6 +2363,27 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
         }];
         self.suspendTimer = timer;
         [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    } else {
+        // 下拉面板收起 = 用户刚从 SpringBoard 自己的界面回到 App。这段时间场景列表正在重排，
+        // 横屏窗口很容易挂到一个马上就失效的场景上，之后 hidden = NO 一个像素都画不出来。
+        // 所以：把所有与"该不该显示"有关的时间戳清零，等过渡动画结束再对齐一次，
+        // 状态对不上就会被 cardVisuallyDetached / 场景自检拆掉重建。
+        self.lastHideTime = 0.0;
+        self.landscapeSince = 0.0;
+        self.portraitSince = 0.0;
+        self.showStallSince = 0.0;
+        self.sceneMismatchSince = 0.0;
+        self.homeScreenSince = 0.0;
+        self.flickerLockUntil = 0.0;
+
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf ensureWindowAttached];
+            [strongSelf refreshNow];
+        });
     }
     [self refreshNow];
 }
@@ -2680,15 +2736,57 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
     NSString *frontmost = nil;
     PGFrontmostKind kind = PGCurrentFrontmost(&frontmost);
 
-    // ① 桌面 / 锁屏 / 通知中心：这里不存在"横屏内容"，直接不显示。
+    // ⚠️ 交叉验证：FBS 的 element level 会被本进程自己的高 level 窗口顶高
+    // （横屏卡片 windowLevel = UIAlert + 1000000，只要它在显示就能把 springboard 顶到最高）。
+    // 所以"最高层是 SpringBoard"不足以证明"在桌面"。当卡片正在显示、却连续被判成桌面
+    // （马上要被藏掉）时，用 LS 的 frontmostApplication 复核一次 —— 那个接口跟窗口层级无关。
+    // 只在"即将误藏"的这一刻查（5 秒最多一次），平时不为它付同步 XPC 的代价。
+    if (kind == PGFrontmostKindHomeScreen && self.visible && self.homeScreenSince > 0.0) {
+        CFTimeInterval nowCross = CACurrentMediaTime();
+        static CFTimeInterval lastCrossCheck = 0.0;
+        if (nowCross - self.homeScreenSince > 1.0 && nowCross - lastCrossCheck > 5.0) {
+            lastCrossCheck = nowCross;
+            NSString *cross = PGFrontmostFromWorkspace();
+            if (cross.length > 0 && ![cross isEqualToString:@"com.apple.springboard"]) {
+                kind = PGFrontmostKindApp;
+                frontmost = cross;
+                self.homeScreenSince = 0.0;
+                PGLog(@"前台: FBS 报桌面但 LS 报 %@ → 以 LS 为准（保住卡片）", cross);
+            }
+        }
+    }
+
+    // ① 桌面 / 锁屏 / 通知中心：这里不存在"横屏内容"，不显示。
     if (kind == PGFrontmostKindHomeScreen) {
         self.frontmostMissingSince = 0.0;
+        CFTimeInterval now = CACurrentMediaTime();
+        // 防抖：正在显示时，必须连续确认 1.2 秒才真的判桌面并收起。
+        // 横屏卡片是本进程（SpringBoard）建的窗口，windowLevel = UIAlert + 1000000，
+        // FBS 布局里 com.apple.springboard 这一元素的 level 会被它顶到最高；探针一旦被
+        // 带偏就会报"在桌面"，一拍就 hide 的话卡片刚显示就被自己藏掉 ——
+        // 用户看到的就是"退出去开几个 App，回来再也没有卡片，大退也没用"。
+        // 本来就不可见时不用等，避免在桌面上多冒一块。
+        if (self.homeScreenSince <= 0.0) {
+            self.homeScreenSince = now;
+            if (!self.visible) {
+                if (![self.lastBlockedApp isEqualToString:@"<home>"]) {
+                    self.lastBlockedApp = @"<home>";
+                    PGLog(@"前台: 当前在桌面/锁屏 → 隐藏横屏块");
+                }
+                return NO;
+            }
+            return YES;
+        }
+        if (now - self.homeScreenSince < 1.2) return self.visible;
+        self.homeScreenSince = 0.0;
         if (![self.lastBlockedApp isEqualToString:@"<home>"]) {
             self.lastBlockedApp = @"<home>";
             PGLog(@"前台: 当前在桌面/锁屏 → 隐藏横屏块");
         }
         return NO;
     }
+    // 拿到真实 App 了：桌面计时作废。
+    self.homeScreenSince = 0.0;
 
     // 探针链路断过又恢复不了的兜底：从进程启动到现在一次都没成功 → 当成不可用。
     BOOL everResolved = PGFrontmostHasEverResolved();
@@ -2802,6 +2900,17 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
 
 #pragma mark 显示
 
+/// 卡片的"视觉存活"自检。只认硬证据，不做猜测：
+/// 状态机说在显示，但窗口本身不在屏幕上 / 被藏回去 / 卡片脱了视图树 —— 那就是坏的，
+/// 必须拆了重建，光把 hidden 设成 NO 是不可能画出来的。
+- (BOOL)cardVisuallyDetached {
+    if (!self.window || !self.card) return YES;
+    if (self.window.isHidden) return YES;
+    if (self.window.screen == nil) return YES;
+    if (self.card.superview == nil) return YES;
+    return NO;
+}
+
 - (BOOL)showCardLeftEdgeUp:(BOOL)leftEdgeUp {
     // 长时间隐藏之后再出现（退桌面 / 切别的 App / 回游戏）：直接把窗口拆了重来。
     // 旧窗口可能挂在一个已失效或已退到后台的场景上，也可能成了孤儿 ——
@@ -2814,6 +2923,19 @@ static CFTimeInterval PGFrontmostStartedAt(void) {
     }
 
     if (![self ensureWindowAndSubviews]) return NO;
+
+    // 视觉脱离自检：状态机认为"在显示"、窗口对象也在，但窗口有硬证据表明它没在屏幕上
+    // （被系统藏回去 / 场景失效导致 screen 为 nil / 卡片被摘出视图树）。
+    // 只靠 showCard 的返回值抓不到这种情况 —— 它把 hidden 设成 NO 就返回 YES 了，
+    // 而窗口可能挂在一个已经失效的场景上，一个像素都不画。这是"回游戏没卡片"的最后一道兜底。
+    if (self.visible && [self cardVisuallyDetached]) {
+        PGLog(@"显示自检: 状态在显示但窗口不可见（hidden=%d screen=%@ card=%@）→ 强制重建",
+              self.window.isHidden, self.window.screen ? @"有" : @"无",
+              self.card.superview ? @"在树上" : @"已脱离");
+        [self teardownWindow];
+        self.lastHideTime = 0.0;
+        if (![self ensureWindowAndSubviews]) return NO;
+    }
 
     // 场景自检：还有可用的 windowScene，但窗口自己没挂上（legacy 窗口 / 场景被系统回收）。
     // 这种窗口把 hidden 设成 NO 也不会渲染 —— 必须重建。
