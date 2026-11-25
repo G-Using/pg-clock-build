@@ -1384,10 +1384,12 @@ static UIImage *_Nullable PGCardSymbol(NSString *name, CGFloat pointSize, UIFont
     _musicNoteView.hidden = NO;
     _musicLabel.hidden = NO;
 
-    CGFloat iconHeight = 10.0 * s;
-    _musicNoteView.frame = CGRectMake(musicLeft, y + (h - iconHeight) / 2.0, noteWidth, iconHeight);
+    CGFloat musicIconHeight = 10.0 * s;
+    _musicNoteView.frame = CGRectMake(musicLeft, y + (h - musicIconHeight) / 2.0,
+                                      noteWidth, musicIconHeight);
     CGFloat stateX = musicRight - stateWidth;
-    _musicStateView.frame = CGRectMake(stateX, y + (h - iconHeight) / 2.0, stateWidth, iconHeight);
+    _musicStateView.frame = CGRectMake(stateX, y + (h - musicIconHeight) / 2.0,
+                                       stateWidth, musicIconHeight);
 
     CGFloat labelX = musicLeft + noteWidth + spacing;
     CGFloat labelRight = _musicStateView.hidden ? musicRight : (stateX - spacing);
